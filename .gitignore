@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+
+# 运行时数据（agent 总线数据库）
+*.db
+*.db-wal
+*.db-shm
