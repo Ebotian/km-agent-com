@@ -161,3 +161,100 @@ test('watcher pid 被复用（cmdline 不是 bus.mjs watch）判为 dead', () =>
       'cmdline 含 bus.mjs watch 的真 watcher 不算聋');
   } finally { cleanup(home); cleanup(root); }
 });
+
+test('registerPresence 的 handle 在会话重启后保持稳定', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: 't', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's2', sessionTitle: 't', cwd: '/p/agent-com' }),
+      'agent-com',
+      '模拟 /new：同一窗口同一 cwd 再注册，不能因为看到自己那一行就换成 agent-com-2');
+
+    const rows = id.listPresence(db, { now: 0, procRoot: '/nonexistent' });
+    assert.equal(rows.length, 1, '同一 tui_pid 仍然只有一行');
+    assert.equal(rows[0].handle, 'agent-com');
+    assert.equal(rows[0].sessionId, 's2');
+  } finally { cleanup(home); }
+});
+
+test('两个窗口的同名目录拿到不同 handle，且各自重复注册不漂移', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 2, sessionId: 's2', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com-2');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1b', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 2, sessionId: 's2b', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com-2', '拿了 -2 的窗口重启后不能被降级回 agent-com');
+
+    assert.deepEqual(
+      id.listPresence(db, { now: 0, procRoot: '/nonexistent' }).map(r => r.handle),
+      ['agent-com', 'agent-com-2'], '两行 handle 必须互不相同');
+  } finally { cleanup(home); }
+});
+
+test('cwd 变了才换 handle', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's2', sessionTitle: '', cwd: '/q/other' }),
+      'other');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's3', sessionTitle: '', cwd: '/q/other' }),
+      'other');
+
+    const rows = id.listPresence(db, { now: 0, procRoot: '/nonexistent' });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].handle, 'other');
+  } finally { cleanup(home); }
+});
+
+test('registerPresence 失败时回滚，且不留下未结束的事务', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.throws(
+      () => id.registerPresence(db, { tuiPid: 1, sessionId: 's', sessionTitle: '', cwd: '/p/---' }),
+      /无法从 cwd 推导主题/, '错误契约来自 topicFromCwd，不再是 topic 模块内部的「主题不能为空」');
+
+    assert.deepEqual(id.listPresence(db, { now: 0, procRoot: '/nonexistent' }), []);
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com', '失败路径已 ROLLBACK，后续 BEGIN IMMEDIATE 不会撞上未结束的事务');
+  } finally { cleanup(home); }
+});
+
+test('listPresence 可裸调（now 与 procRoot 都有默认值）', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: '', cwd: '/p/agent-com' });
+
+    const rows = id.listPresence(db);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].handle, 'agent-com');
+    assert.equal(rows[0].deaf, 'never');
+  } finally { cleanup(home); }
+});
+
+test('listPresence 省略 now 时用当前时间，不把过期租约报成不聋', () => {
+  const home = makeTmpHome();
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 500, comm: 'node', ppid: 1, cmdline: 'node bin/bus.mjs watch' },
+  ]);
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.registerPresence(db, { tuiPid: 100, sessionId: 's1', sessionTitle: '', cwd: '/p/a' });
+    id.setWatcher(db, { tuiPid: 100, watcherPid: 500, watcherUntil: 1 });   // 1970 年就到期了
+
+    const rows = id.listPresence(db, { procRoot: root });                   // 故意不传 now
+    assert.equal(rows[0].deaf, 'expired', 'now 默认为当前时间 ⇒ 过期租约不能报成 null');
+    assert.equal(rows[0].alive, true, '对照：窗口本身是活的');
+  } finally { cleanup(home); cleanup(root); }
+});

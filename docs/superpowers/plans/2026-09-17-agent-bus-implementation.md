@@ -1080,11 +1080,12 @@ git commit -m "feat: posts.mjs 发帖/增量读/游标/订阅；修正 spec 谓�
   - `removePresence(db, {tuiPid}): void`
   - `setWatcher(db, {tuiPid, watcherPid, watcherUntil}): void`
   - `clearWatcher(db, {tuiPid}): void`
-  - `listPresence(db, {now, procRoot?}): Array<Presence>`，`Presence = {tuiPid, sessionId, sessionTitle, cwd, handle, alive: boolean, deaf: 'never' | 'dead' | 'expired' | null}`
-  - `handleFromCwd(db, cwd): string` —— basename 规范化，与已有 handle 冲突时追加 `-2`、`-3`
+  - `listPresence(db, {now = Date.now(), procRoot?}): Array<Presence>`，`Presence = {tuiPid, sessionId, sessionTitle, cwd, handle, alive: boolean, deaf: 'never' | 'dead' | 'expired' | null}` —— `now` 有默认值（省略时用当前时间；否则 `watcher_until <= undefined` 恒假，会把过期租约**静默报成不聋**）
+  - `handleFromCwd(db, cwd, {excludeTuiPid = null} = {}): string` —— basename 走 `topicFromCwd(cwd)`（错误契约是 `无法从 cwd 推导主题: <cwd>`）；`excludeTuiPid` 指定的那一行**不算占位**（同一窗口 `/new` 后 handle 稳定，不再看到自己那一行）；仍冲突时追加 `-2`、`-3`
+  - `registerPresence(db, {tuiPid, sessionId, sessionTitle, cwd}): string` —— 在 `BEGIN IMMEDIATE` 事务里"算 handle + `upsertPresence`"，返回 handle。**并发启动的同名目录窗口不会撞名**（读-写分离时两个窗口会读到同一个快照、拿到同一个 handle）
   - `reapDead(db, {procRoot?}): number`
 
-> **实现陷阱（spec §8.1 已记录）**：node 会重写 `process.title`，`/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着一长串 **NUL** 填充（实测本机活窗口：`kimi-code` + 168 个 `\0`；也可能是字面空格）。**必须用 `/^kimi-code\s*$/` 判断，不能用精确相等。** 假 proc 树里的测试数据要按同样格式写，否则测不出这个坑。
+> **实现陷阱（spec §8.1 已记录）**：node 会重写 `process.title`，`/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着一长串 **NUL** 填充，**长度不是定值**（实测本机两个活窗口：169 字节 = 9 + 160 个 `\0`、166 字节 = 9 + 157 个 `\0`；总长取决于该进程 argv 区的长度）；也可能是字面空格。**必须用 `/^kimi-code\s*$/` 判断，不能用精确相等。** 假 proc 树里的测试数据要按同样格式写，否则测不出这个坑。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1254,6 +1255,103 @@ test('watcher pid 被复用（cmdline 不是 bus.mjs watch）判为 dead', () =>
       'cmdline 含 bus.mjs watch 的真 watcher 不算聋');
   } finally { cleanup(home); cleanup(root); }
 });
+
+test('registerPresence 的 handle 在会话重启后保持稳定', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: 't', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's2', sessionTitle: 't', cwd: '/p/agent-com' }),
+      'agent-com',
+      '模拟 /new：同一窗口同一 cwd 再注册，不能因为看到自己那一行就换成 agent-com-2');
+
+    const rows = id.listPresence(db, { now: 0, procRoot: '/nonexistent' });
+    assert.equal(rows.length, 1, '同一 tui_pid 仍然只有一行');
+    assert.equal(rows[0].handle, 'agent-com');
+    assert.equal(rows[0].sessionId, 's2');
+  } finally { cleanup(home); }
+});
+
+test('两个窗口的同名目录拿到不同 handle，且各自重复注册不漂移', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 2, sessionId: 's2', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com-2');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1b', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 2, sessionId: 's2b', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com-2', '拿了 -2 的窗口重启后不能被降级回 agent-com');
+
+    assert.deepEqual(
+      id.listPresence(db, { now: 0, procRoot: '/nonexistent' }).map(r => r.handle),
+      ['agent-com', 'agent-com-2'], '两行 handle 必须互不相同');
+  } finally { cleanup(home); }
+});
+
+test('cwd 变了才换 handle', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's2', sessionTitle: '', cwd: '/q/other' }),
+      'other');
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's3', sessionTitle: '', cwd: '/q/other' }),
+      'other');
+
+    const rows = id.listPresence(db, { now: 0, procRoot: '/nonexistent' });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].handle, 'other');
+  } finally { cleanup(home); }
+});
+
+test('registerPresence 失败时回滚，且不留下未结束的事务', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    assert.throws(
+      () => id.registerPresence(db, { tuiPid: 1, sessionId: 's', sessionTitle: '', cwd: '/p/---' }),
+      /无法从 cwd 推导主题/, '错误契约来自 topicFromCwd，不再是 topic 模块内部的「主题不能为空」');
+
+    assert.deepEqual(id.listPresence(db, { now: 0, procRoot: '/nonexistent' }), []);
+    assert.equal(id.registerPresence(db, { tuiPid: 1, sessionId: 's', sessionTitle: '', cwd: '/p/agent-com' }),
+      'agent-com', '失败路径已 ROLLBACK，后续 BEGIN IMMEDIATE 不会撞上未结束的事务');
+  } finally { cleanup(home); }
+});
+
+test('listPresence 可裸调（now 与 procRoot 都有默认值）', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.registerPresence(db, { tuiPid: 1, sessionId: 's1', sessionTitle: '', cwd: '/p/agent-com' });
+
+    const rows = id.listPresence(db);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].handle, 'agent-com');
+    assert.equal(rows[0].deaf, 'never');
+  } finally { cleanup(home); }
+});
+
+test('listPresence 省略 now 时用当前时间，不把过期租约报成不聋', () => {
+  const home = makeTmpHome();
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 500, comm: 'node', ppid: 1, cmdline: 'node bin/bus.mjs watch' },
+  ]);
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.registerPresence(db, { tuiPid: 100, sessionId: 's1', sessionTitle: '', cwd: '/p/a' });
+    id.setWatcher(db, { tuiPid: 100, watcherPid: 500, watcherUntil: 1 });   // 1970 年就到期了
+
+    const rows = id.listPresence(db, { procRoot: root });                   // 故意不传 now
+    assert.equal(rows[0].deaf, 'expired', 'now 默认为当前时间 ⇒ 过期租约不能报成 null');
+    assert.equal(rows[0].alive, true, '对照：窗口本身是活的');
+  } finally { cleanup(home); cleanup(root); }
+});
 ```
 
 > **为什么 `fakeProc` 写的是 `cmdline + '\0'`**：`/proc/<pid>/cmdline` 的格式是**每个 argv 元素以 NUL 终止**，NUL 只出现在元素之间、末尾一个终止符，**不是逐字符插 NUL**。逐字符插（`cmdline.split('').join('\0') + '\0'`）会产出 `k\0i\0m\0i\0-…`，被 `readCmdline` 的 `.replace(/\0/g, ' ')` 还原成 `k i m i - c o d e`，于是 `/^kimi-code\s*$/` 永不匹配、`cmdlineRole` 恒返回 `null`——假 proc 树里所有依赖 cmdline 的判定都会失效。测试数据里的 `'kimi-code      '` 本身保留（它模拟 `process.title` 重写后可能出现的空格填充），只在尾巴上补一个正常的 argv 终止符。
@@ -1271,7 +1369,7 @@ Expected: FAIL —— `Cannot find module '../lib/identity.mjs'`
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { normalizeTopic } from './topic.mjs';
+import { topicFromCwd } from './topic.mjs';
 
 export const DEFAULT_PROC_ROOT = '/proc';
 
@@ -1368,7 +1466,7 @@ function deafState(row, { now, procRoot }) {
   return null;
 }
 
-export function listPresence(db, { now, procRoot = DEFAULT_PROC_ROOT }) {
+export function listPresence(db, { now = Date.now(), procRoot = DEFAULT_PROC_ROOT } = {}) {
   return db.prepare(`
     SELECT tui_pid AS tuiPid, session_id AS sessionId, session_title AS sessionTitle,
            cwd, handle, watcher_pid AS watcherPid, watcher_until AS watcherUntil
@@ -1380,15 +1478,31 @@ export function listPresence(db, { now, procRoot = DEFAULT_PROC_ROOT }) {
   }));
 }
 
-export function handleFromCwd(db, cwd) {
-  const base = normalizeTopic(cwd.replace(/\/+$/, '').split('/').pop() ?? '');
-  const taken = new Set(db.prepare('SELECT handle FROM presence').all().map(r => r.handle));
+export function handleFromCwd(db, cwd, { excludeTuiPid = null } = {}) {
+  const base = topicFromCwd(cwd);
+  const rows = excludeTuiPid == null
+    ? db.prepare('SELECT handle FROM presence').all()
+    : db.prepare('SELECT handle FROM presence WHERE tui_pid <> ?').all(excludeTuiPid);
+  const taken = new Set(rows.map(r => r.handle));
   if (!taken.has(base)) return base;
   for (let n = 2; n < 1000; n++) {
     const cand = `${base}-${n}`;
     if (!taken.has(cand)) return cand;
   }
   throw new Error(`handle 冲突过多: ${base}`);
+}
+
+export function registerPresence(db, { tuiPid, sessionId, sessionTitle, cwd }) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const handle = handleFromCwd(db, cwd, { excludeTuiPid: tuiPid });
+    upsertPresence(db, { tuiPid, sessionId, sessionTitle, cwd, handle });
+    db.exec('COMMIT');
+    return handle;
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  }
 }
 
 export function reapDead(db, { procRoot = DEFAULT_PROC_ROOT } = {}) {
@@ -1407,7 +1521,7 @@ export function reapDead(db, { procRoot = DEFAULT_PROC_ROOT } = {}) {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `node --test test/identity.test.mjs`
-Expected: PASS，10 个用例全绿
+Expected: PASS，16 个用例全绿
 
 - [ ] **Step 5: 提交**
 
@@ -1416,7 +1530,10 @@ git add lib/identity.mjs test/identity.test.mjs
 git commit -m "feat: identity.mjs 祖先遍历/存活判定/presence 与 watcher 登记"
 ```
 
-> **上面两个代码块是交付态（含后续 `fix:` 提交的 R-G1 修正）**：存活判定不只看 `/proc/<pid>` 目录是否存在，而是 `pidEntryExists(pid) && cmdlineRole(readCmdline(pid)) === <role>`（`pidHasRole`）——`listPresence.alive` 与 `reapDead` 用 `'kimi-code'`，`deafState` 判"watcher 已死"用 `'bus-watch'`。这是 spec §8.1 的 `alive := 进程存在 且 cmdline 是 kimi-code` 与 §8.3 的"判死活仍用同一套检查，只是校验 `bus.mjs watch`"的落地；不这样做，一个被回收后分配给别的进程的 pid 会被误判成活窗口，而 `cmdlineRole` 的 `'bus-watch'` 分支会变成死代码。僵尸进程的 `/proc` 目录仍在但 `cmdline` 为空 ⇒ `cmdlineRole` 返回 `null` ⇒ 判为不活。
+> **上面两个代码块是交付态（含后续 `fix:` 提交的 R-G1、R-I1 修正）**：
+> - **R-G1**：存活判定不只看 `/proc/<pid>` 目录是否存在，而是 `pidEntryExists(pid) && cmdlineRole(readCmdline(pid)) === <role>`（`pidHasRole`）——`listPresence.alive` 与 `reapDead` 用 `'kimi-code'`，`deafState` 判"watcher 已死"用 `'bus-watch'`。这是 spec §8.1 的 `alive := 进程存在 且 cmdline 是 kimi-code` 与 §8.3 的"判死活仍用同一套检查，只是校验 `bus.mjs watch`"的落地；不这样做，一个被回收后分配给别的进程的 pid 会被误判成活窗口，而 `cmdlineRole` 的 `'bus-watch'` 分支会变成死代码。僵尸进程的 `/proc` 目录仍在但 `cmdline` 为空 ⇒ `cmdlineRole` 返回 `null` ⇒ 判为不活。
+> - **R-I1（handle 稳定性）**：`handleFromCwd` 新增 `excludeTuiPid`——它**不能把自己那一行算成占位**，否则同一窗口每次 `/new` 都会换 handle（`agent-com` → `agent-com-2` → 又变回 `agent-com`），而 `@handle` 寻址依赖 handle 稳定。新增的 `registerPresence` 把"算 handle + 写 presence"收进一个 `BEGIN IMMEDIATE` 事务：读-写分离时两个同 basename 目录的窗口会在同一 hook 时延内读到同一快照、拿到**同一个 handle**（实测 8 个并发窗口有 5 行撞名），事务化后 8 行互不相同。`presence.handle` 没有 UNIQUE 约束，这条只能靠事务守。`listPresence` 的 `now` 默认 `Date.now()`，避免省略时把过期租约报成"不聋"。
+> - **下游调用方注意（Task 10）**：SessionStart hook 必须用 `registerPresence`（而不是 `handleFromCwd` + `upsertPresence` 两步），否则 R-I1 的事务保护不会生效。
 
 ---
 
