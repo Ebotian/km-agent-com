@@ -58,14 +58,15 @@ function readStdin() {
 }
 
 /**
- * 本窗口的 tui_pid：`AGENT_BUS_TUI_PID` 显式指定优先（测试与降级用），否则
- * 沿 /proc/<pid>/stat 向上找 cmdline 为 kimi-code 的祖先（hook 是 shell 拉起的，
- * 直接父进程是 /bin/sh，所以必须遍历）。
+ * 本窗口的 tui_pid：`AGENT_BUS_TUI_PID` 显式指定优先（测试与降级用），否则从**自己**往上
+ * 沿 /proc 找 cmdline 为 kimi-code 的祖先。
+ *
+ * 起点必须是 `process.pid` 而不是 `process.ppid`：引擎用 `shell: true` 起 hook，
+ * `/bin/sh -c "单条命令"` 会把命令 exec 掉，此时直接父进程**就是**窗口自己——传 ppid 会
+ * 让 `resolveWindow` 从窗口的父进程起算，整整跳过一层，认不出自己的窗口。
  */
 function selfTuiPid(procRoot) {
-  const forced = Number(process.env.AGENT_BUS_TUI_PID);
-  if (Number.isInteger(forced) && forced > 0) return forced;
-  return identity.findKimiAncestor(process.ppid, procRoot);
+  return identity.resolveWindow({ procRoot, pid: process.env.AGENT_BUS_TUI_PID });
 }
 
 /** 从 PreToolUse 载荷里抠出本次要触碰的路径；抠不出来就返回 []（放行） */
@@ -231,8 +232,20 @@ async function main() {
 
   if (event === 'SessionStart') {
     const tuiPid = selfTuiPid(procRoot);
-    // 认不出自己是哪个窗口就别乱写：写进去的行没有任何人能回收
-    if (tuiPid == null) return 0;
+    // 认不出自己是哪个窗口就别乱写：写进去的行没有任何人能回收。但**不能无声无息**——
+    // 这条分支以前连审计都没有（不开库、不写日志），于是"窗口从未登记"在现场什么都不剩：
+    // 这次那个"祖先遍历跳过一层"的缺陷就是这样潜伏了整轮，`presence` 一直是空的而没人知道。
+    if (tuiPid == null) {
+      try {
+        appendLog(home, {
+          actor: sid || '?', action: 'session-start-unidentified',
+          detail: `self=${process.pid} ppid=${process.ppid}` +
+            `(${boundedJson(identity.readCmdline(process.ppid, procRoot))})` +
+            ` cwd=${payload.cwd || process.cwd()}`,
+        });
+      } catch { /* 审计写不出去也不该影响退出码 */ }
+      return 0;
+    }
     const cwd = payload.cwd || process.cwd();
     return sessionStart(openDb(dbPath), { payload, sid, tuiPid, cwd, home, procRoot });
   }

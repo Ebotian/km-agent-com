@@ -136,16 +136,21 @@ function rowRow(r) {
   };
 }
 
-/** 自身身份：显式 --session 优先，否则沿 /proc 找 kimi-code 祖先再查 presence */
+/**
+ * 自身身份：显式 `--session` 优先，否则 `--tui-pid`，再否则从**自己**往上沿 /proc 找
+ * kimi-code 祖先（`resolveWindow`，与 hook 共用同一步），最后拿 pid 查 presence。
+ *
+ * 起点是 `process.pid` 而不是 `process.ppid`：CLI 也是被壳层拉起来的，中间有没有一层
+ * shell 取决于命令形态，从父进程起算会跳过窗口那一层（见 `findKimiAncestor`）。
+ */
 function resolveSelf(c, { required = true } = {}) {
   const explicit = c.flags.session;
-  const pidFromEnv = c.flags['tui-pid'] ? Number(c.flags['tui-pid']) : null;
   if (explicit) {
     const row = c.db.prepare('SELECT * FROM presence WHERE session_id = ?').get(explicit);
     if (!row) throw new Error(`本窗口未在 presence 中登记（session=${explicit}）`);
     return rowRow(row);
   }
-  const tuiPid = pidFromEnv ?? identity.findKimiAncestor(process.ppid, c.procRoot);
+  const tuiPid = identity.resolveWindow({ procRoot: c.procRoot, pid: c.flags['tui-pid'] });
   if (tuiPid == null) {
     if (required) throw new Error('找不到所属窗口；请用 --session <id> 显式指定');
     return null;

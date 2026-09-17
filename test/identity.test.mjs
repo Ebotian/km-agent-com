@@ -43,6 +43,47 @@ test('findKimiAncestor 跳过中间的 shell，找到 kimi-code 祖先', () => {
   } finally { cleanup(root); }
 });
 
+/**
+ * 生产形态：引擎用 `shell: true` 起 hook，而 `/bin/sh -c "单条命令"` 会把命令 **exec 掉**，
+ * 于是 hook 的直接父进程**就是** kimi-code 窗口自己——祖先链上只有一层。
+ *
+ * 所以起点必须是**含**自己的：`resolveWindow` 的默认 `startPid` 是 `process.pid`
+ * （"从我自己往上找"），实现却只查父链、把起点那一层跳过去 ⇒ 传 ppid 就等于从窗口的
+ * 父进程开始找，整条 walk 落空，窗口**静默**不登记。
+ */
+test('kimi-code ← node（shell 被 exec 掉）：起点自己就在链上，认得出窗口', () => {
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 300, comm: 'node', ppid: 100, cmdline: 'node hook.mjs' },
+  ]);
+  try {
+    assert.equal(id.findKimiAncestor(300, root), 100);
+    assert.equal(id.findKimiAncestor(100, root), 100, '起点本身就是窗口时也要认得自己');
+  } finally { cleanup(root); }
+});
+
+test('resolveWindow：两种祖先链形态都解得出窗口，显式 pid 优先', () => {
+  const withShell = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 200, comm: 'sh', ppid: 100, cmdline: 'sh -c node hook.mjs' },
+    { pid: 300, comm: 'node', ppid: 200, cmdline: 'node hook.mjs' },
+  ]);
+  const execd = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 300, comm: 'node', ppid: 100, cmdline: 'node hook.mjs' },
+  ]);
+  try {
+    assert.equal(id.resolveWindow({ procRoot: withShell, startPid: 300 }), 100, '中间隔着 shell');
+    assert.equal(id.resolveWindow({ procRoot: execd, startPid: 300 }), 100, 'shell 被 exec 掉');
+    assert.equal(id.resolveWindow({ procRoot: execd, startPid: 300, pid: 999 }), 999,
+      '显式指定的 pid（AGENT_BUS_TUI_PID / --tui-pid）优先，且不查 /proc');
+    assert.equal(id.resolveWindow({ procRoot: execd, startPid: 300, pid: '0' }), 100,
+      '0 / 空 / 非法值一律当作"没给"，不能当成 pid 0');
+    assert.equal(id.resolveWindow({ procRoot: execd, startPid: 300, pid: '' }), 100);
+    assert.equal(id.resolveWindow({ procRoot: execd, startPid: 300, pid: 'abc' }), 100);
+  } finally { cleanup(withShell); cleanup(execd); }
+});
+
 test('findKimiAncestor 找不到时返回 null，且不会因环而挂死', () => {
   const root = fakeProc([
     { pid: 1, comm: 'init', ppid: 1, cmdline: 'init' },

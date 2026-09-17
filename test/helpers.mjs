@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO = dirname(HERE);
 export const CLI = join(REPO, 'bin', 'bus.mjs');
 export const HOOK = join(REPO, 'hooks', 'bus-hook.mjs');
+export const FAKE_WINDOW = join(HERE, 'fixtures', 'kimi-window.js');
 
 export function makeTmpHome() {
   return mkdtempSync(join(tmpdir(), 'agent-bus-test-'));
@@ -131,6 +132,54 @@ export function runHook(payload, opts = {}) {
     env: hookEnv(opts),
   });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+}
+
+/**
+ * 在**假窗口进程**里跑 hook —— 唯一能测到"真实那条祖先 walk"的夹具。
+ *
+ * 为什么要造一个进程：hook 自己的 pid 只有起来之后才知道，假 procRoot 里没法预先摆好
+ * 它自己那一层；而本用例要钉的恰恰是"从 hook 自己往上找"这条链。假窗口用
+ * `exec -a kimi-code` 把 argv[0] 换成 `kimi-code`，于是 `/proc/<pid>/cmdline` 就是
+ * `kimi-code`，与真窗口在 `cmdlineRole` 眼里完全一样；再由它按引擎的形态
+ * （`shell: true` ⇒ `/bin/sh -c`）拉起 hook。
+ *
+ * **不注入 `AGENT_BUS_TUI_PID`（显式删掉），也不注入 `AGENT_BUS_PROC_ROOT`** ⇒ hook 走
+ * 真实 /proc、真实那条 walk。home 仍然是临时的（`HOME` 与 `KIMI_CODE_HOME` 一起指过去），
+ * 不碰开发者真实的数据目录。
+ *
+ * @param cmd shell 里的 hook 命令；两种祖先链形态靠它区分：
+ *   `node "<hook>"` ⇒ `/bin/sh -c` 把命令 exec 掉（生产形态：hook 的直接父进程就是窗口）；
+ *   `node "<hook>"; :` ⇒ 复合命令，sh 不能 exec，祖先链上多出一层 shell。
+ * @returns {{status:number, stdout:string, stderr:string, windowPid:number|null, hookStatus:number|null}}
+ *   `status`/`stdout`/`stderr` 是假窗口那一层的；`hookStatus` 是 hook 自己的退出码。
+ */
+export function runHookInFakeWindow(payload, { home, cmd }) {
+  if (!home) throw new Error('runHookInFakeWindow 需要 home');
+  const pidFile = join(home, 'fake-window.pid');
+  const env = {
+    ...process.env,
+    HOME: home,
+    KIMI_CODE_HOME: home,
+    KIMI_PLUGIN_ROOT: REPO,
+    FAKE_WINDOW_PIDFILE: pidFile,
+    FAKE_WINDOW_CMD: cmd,
+    FAKE_WINDOW_PAYLOAD: JSON.stringify(payload),
+  };
+  delete env.AGENT_BUS_TUI_PID;
+  delete env.AGENT_BUS_PROC_ROOT;
+  const r = spawnSync('/bin/bash', ['-c', `exec -a kimi-code "${process.execPath}" < "${FAKE_WINDOW}"`],
+    { encoding: 'utf8', env });
+  let inner = {};
+  try { inner = JSON.parse(r.stdout ?? ''); } catch { /* 假窗口自己都没跑起来：交给断言去说 */ }
+  let windowPid = null;
+  try { windowPid = Number(readFileSync(pidFile, 'utf8')); } catch { /* 同上 */ }
+  return {
+    status: r.status,
+    stdout: inner.stdout ?? '',
+    stderr: `${r.stderr ?? ''}${inner.stderr ?? ''}`,
+    windowPid: Number.isInteger(windowPid) ? windowPid : null,
+    hookStatus: inner.status ?? null,
+  };
 }
 
 /**
