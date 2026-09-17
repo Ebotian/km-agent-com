@@ -41,3 +41,26 @@ test('openDb 会创建缺失的父目录', () => {
     assert.ok(db);
   } finally { cleanup(home); }
 });
+
+test('§5 的列级约束与索引在运行时强制', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+
+    assert.throws(() => db.prepare(
+      'INSERT INTO presence (tui_pid, session_id, cwd, handle) VALUES (?, ?, ?, ?)'
+    ).run(1, null, '/tmp', 'me'), /NOT NULL/);
+
+    assert.throws(() => db.prepare(
+      'INSERT INTO posts (seq, topic, author_session, origin, kind, title, ts) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(1, 't', 's', 'agent', 'status', 'x', 1), /CHECK constraint failed/);
+
+    assert.throws(() => db.prepare(
+      'INSERT INTO posts (seq, topic, author_session, origin, kind, title, ts) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(2, 't', 's', 'system', 'request', 'x', 1), /CHECK constraint failed/);
+
+    assert.ok(db.prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='index' AND name='posts_topic_seq'"
+    ).get());
+  } finally { cleanup(home); }
+});

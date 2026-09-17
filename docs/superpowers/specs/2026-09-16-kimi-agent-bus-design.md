@@ -140,6 +140,22 @@ subs(reader_session TEXT, pattern TEXT,     -- 'agent-com'（含子树）、'age
      PRIMARY KEY(reader_session, pattern))
 ```
 
+**列级约束（运行时强制，不是注释）**：上面的 SQL 块是列级草图，下面这张表才是契约的权威描述——`lib/db.mjs` 的 DDL 把这些约束**在运行时强制**，违反即抛错。
+
+| 约束 | 位置 | 说明 |
+|---|---|---|
+| `NOT NULL` | `presence.session_id` / `.cwd` / `.handle` | 登记时三者必然已知：无 `session_id` 无法寻址，无 `cwd` 无法解析正文里的相对路径证据指针（§6.4 硬规则 1），无 `handle` 无法渲染发帖人 |
+| `NOT NULL` | `posts.ts` | `posts` 不可变，每一行都有确定的写入时刻 |
+| `NOT NULL` | `read_cursor.last_seq` | 有读者行就必有位点；"行存在但位点未知"没有语义 |
+| `NOT NULL` | `subs.reader_session` / `subs.pattern` | 两者同为主键，缺一不可 |
+| `CHECK (origin IN ('human','agent'))` | `posts.origin` | 依据 §6.4：取值域是**闭合**的——原设计的第三个取值 `system` 已删除（插件不往总线发帖） |
+| `CHECK (kind IN ('request','finding'))` | `posts.kind` | 依据 §6.4：只有两种内容类型，`answer` / `status` / `note` 三个取值已删除 |
+| 索引 `posts_topic_seq(topic, seq)` | `posts` | 依据 §6.1：订阅谓词 `topic = pattern OR topic LIKE pattern || '/%'` **可以走索引**；第二列 `seq` 支撑按主题的游标顺序扫描 |
+
+**方向是"更严"，不是"不同"**：列名与列序与上面的 SQL 块逐字一致，这里只是把原先仅写在注释里的取值域、以及隐含的非空前提，提升为强制约束。因此按 SQL 块以为可以传 NULL 的调用方会在运行时报错（`node:sqlite` 把未绑定的 `undefined` 绑成 NULL，漏传参数同样会撞上 NOT NULL）。
+
+**下列列保持可空**，因为它们是可选信息，调用方在缺省时确实传 NULL：`presence.session_title`（未取到标题）、`presence.watcher_pid` / `.watcher_until`（L1 watcher 未自注册，见 §8.3）、`posts.author_cwd`（可空，尽管列注释称其"承重"：缺省时正文里的相对路径证据指针不可解析，但不因此拒绝写入该帖）、`posts.body`（Layer B 的 triage 行可以自足，见 §6.4）、`posts.to_session`（NULL = 只发到主题）、`posts.reply_to`（非回复帖）、`claims.completed_at`（仅一次性资源会置，见上）、`claims.note`。
+
 **设计要点**：
 
 - **只有两张有语义的表**：`posts` 不可变、`claims` 可变。判据是**生命周期是否不同**——原设计的 `room` / `topic`（生命周期完全相同）因此不成立（§6.1），而 `posts` / `claims` 成立。
