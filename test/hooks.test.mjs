@@ -57,7 +57,19 @@ test('SessionStart 登记 presence 并种下默认订阅', () => {
   } finally { cleanup(home); }
 });
 
-test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登记', () => {
+/**
+ * 同一窗口重复 `SessionStart`：不产生第二行、不抖动 handle，也**不动** watcher 登记（R-E6）。
+ *
+ * 后半句是本轮裁决改掉的语义：以前 `upsertPresence` **无条件**把 `watcher_pid`/`watcher_until`
+ * 清成 NULL，本用例第 81 行原来断言的正是那个旧行为（`watcher_pid === null`）。但这条形态
+ * ——同一 `session_id` 再登记一次（`source=resume` 恢复同一会话就是它）——旧 watcher 很可能
+ * **还在跑**：清掉登记 ⇒ 窗口被判成"从未武装" ⇒ 自愈逻辑再武装一个 ⇒ 同一窗口两个 watcher
+ * 抢同一条消息（每次命中都是整上下文重读）。判据与 `removePresence` 同一句话："这一行还是
+ * 我的吗"。
+ *
+ * "换了会话才清"那一半仍然钉在上面第 68 行（`session_old` → `SESSION`）。
+ */
+test('SessionStart 重复触发不产生重复 presence、不抖动 handle，且保留同一会话的 watcher 登记', () => {
   const home = makeTmpHome();
   try {
     // 旧会话 + 一个健康 watcher（假 /proc 里有对应的 bus-watch 条目）
@@ -66,7 +78,7 @@ test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登�
 
     const db = dbOf(home);
     assert.equal(db.prepare('SELECT watcher_pid FROM presence WHERE tui_pid = ?').get(ME_PID).watcher_pid, null,
-      'SessionStart 必须清掉旧 watcher 登记（新会话还没武装）');
+      '换了会话 ⇒ 旧 watcher 登记必须清掉（新会话还没武装）');
     identity.setWatcher(db, { tuiPid: ME_PID, watcherPid: 555, watcherUntil: 9e15 });
     db.close();
 
@@ -78,8 +90,45 @@ test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登�
     const row = db2.prepare('SELECT * FROM presence WHERE tui_pid = ?').get(ME_PID);
     assert.equal(row.session_id, SESSION);
     assert.equal(row.handle, HANDLE, 'R-H2：重复开窗不许抖动 handle');
-    assert.equal(row.watcher_pid, null);
+    assert.equal(row.watcher_pid, 555,
+      'R-E6：同一会话重复登记不许清 watcher（旧 watcher 还在跑；清了会让自愈逻辑再武装一个）');
     db2.close();
+  } finally { cleanup(home); }
+});
+
+/**
+ * R-E6 的端到端形状（真 hook + 真 CLI）：武装 watcher → **resume 同一会话** → `whoami --json`
+ * 的 `deaf` 仍是 `null`（"在听"），而不是 `'never'`。
+ *
+ * 这一条直接对应 skill 的幂等前提：`deaf === null` 是"不要重复武装"的唯一判据
+ * （`skills/agent-bus/SKILL.md`）。它一旦被误报成 `'never'`，agent 就会再起一个 watcher，
+ * 于是同一窗口两个 watcher 抢同一条消息——每次命中都是整上下文重读。
+ */
+test('R-E6：resume 同一会话后 watcher 登记与 deaf 状态都不变', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home, { watcherPid: 555 });
+    const before = runCli(['whoami', '--json', '--tui-pid', String(ME_PID)],
+      { home, procRoot: procRootOf(home) });
+    assert.equal(before.status, 0, before.stderr);
+    assert.equal(JSON.parse(before.stdout).deaf, null, '前置：夹具先要真的是"在听"');
+
+    const r = runHook(event('SessionStart', { session_title: 'T', source: 'resume' }),
+      { home, tuiPid: ME_PID });
+    assert.equal(r.status, 0, r.stderr);
+
+    const db = dbOf(home);
+    const row = db.prepare('SELECT * FROM presence WHERE tui_pid = ?').get(ME_PID);
+    db.close();
+    assert.equal(row.session_id, SESSION);
+    assert.equal(row.watcher_pid, 555, 'resume 同一会话不许清掉 watcher 登记');
+
+    const after = runCli(['whoami', '--json', '--tui-pid', String(ME_PID)],
+      { home, procRoot: procRootOf(home) });
+    assert.equal(after.status, 0, after.stderr);
+    const me = JSON.parse(after.stdout);
+    assert.equal(me.deaf, null, `deaf 必须仍是 null（在听），报成 ${JSON.stringify(me.deaf)} 会让 skill 再武装一个`);
+    assert.equal(me.watcherPid, 555);
   } finally { cleanup(home); }
 });
 

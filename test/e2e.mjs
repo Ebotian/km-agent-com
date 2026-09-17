@@ -67,6 +67,20 @@ function seedWindowProc({ procRoot }, pid) {
   writeFileSync(join(d, 'cmdline'), 'kimi-code\0');
 }
 
+/**
+ * watcher 进程在假 /proc 里的形状（`cmdlineRole` → 'bus-watch'）。
+ *
+ * 必须按 watcher 的**真实 pid** 补这一条：`AGENT_BUS_PROC_ROOT` 指向假 /proc，而 `deafState`
+ * 就是拿它对 `watcher_pid` 判死活的。少了它，一个活得好好的 watcher 会被判成 `'dead'`——
+ * 那正是本场景要排除的那种误判。
+ */
+function seedWatcherProc({ procRoot }, pid) {
+  const d = join(procRoot, String(pid));
+  mkdirSync(d, { recursive: true });
+  writeFileSync(join(d, 'stat'), `${pid} (node) S 1 1 1 0 -1 0 0 0\n`);
+  writeFileSync(join(d, 'cmdline'), `node /x/bin/bus.mjs watch --session e2e\0`);
+}
+
 function cli(args, { home, procRoot, allowFail = false } = {}) {
   const r = spawnSync(process.execPath, [CLI, ...args], {
     encoding: 'utf8',
@@ -138,6 +152,16 @@ const B_PID = 90002;
 const C_PID = 90003;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** 轮询等一个条件成立（给真实后台进程留出启动/写库的时间），超时就**失败**而不是继续跑。 */
+async function waitFor(cond, ms, what) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (cond()) return;
+    if (Date.now() > deadline) throw new Error(`等待超时（${ms}ms）: ${what}`);
+    await sleep(25);
+  }
+}
 
 let watcher = null;
 
@@ -246,7 +270,7 @@ async function main() {
   console.log('✓ 任务完结后从开放列表消失，且 completed_at 落库（不复活）');
 
   await concurrentRegistration();
-  sessionSwitch();
+  await sessionSwitch();
   precheckGate();
 
   console.log('\nE2E OK');
@@ -295,9 +319,10 @@ async function concurrentRegistration() {
  *
  * 这里用真 hook + 真 CLI 跑一遍那个交错，并顺手钉住"载荷缺 `session_id` 的 end 只留审计、
  * 不删行"。断言全部读库核对（CLI 的输出是被测对象，不拿它验它自己），只在最后用一次
- * `whoami` 看用户可见形态。
+ * `whoami` 看用户可见形态。R-E6（resume 同一会话保留 watcher 登记）也挂在这一段后面，
+ * 用的是**真 watcher 进程**。
  */
-function sessionSwitch() {
+async function sessionSwitch() {
   const h = newHome('new');
   const pid = 90021;
   const OLD_S = 'session_swold-0001';
@@ -324,6 +349,34 @@ function sessionSwitch() {
   assert(logged.some(e => e.action === 'session-end-missing-session'), '跳过删除必须留痕（否则现场无痕）');
 
   console.log('✓ /new 交错（start(new) → end(old)）后窗口仍登记着新会话；缺 session_id 的 end 只留审计不删行');
+
+  // R-E6：watcher 登记只在**会话真的换了**时才清。这里用真 watcher 进程跑 resume 形态：
+  // 同一会话再登记一次 ⇒ 登记与 `deaf` 都必须原样保留（`deaf === null` 是 skill"不要重复
+  // 武装"的唯一判据；误报成 'never' 会再武装一个 watcher，两个 watcher 抢同一条消息）。
+  const w = spawn(process.execPath, [CLI, 'watch', '--tui-pid', String(pid), '--interval', '50'],
+    { env: envOf(h) });
+  try {
+    await waitFor(() => query(h, 'SELECT watcher_pid FROM presence')[0]?.watcher_pid === w.pid,
+      3000, 'watcher 自注册');
+    // 真 watcher 的 pid 必须能在假 /proc 里查到 `bus.mjs watch`，否则 deafState 会判它 'dead'
+    seedWatcherProc(h, w.pid);
+    const hearing = JSON.parse(cli(['whoami', '--json', '--tui-pid', String(pid)], h).stdout);
+    assert(hearing.deaf === null, `前置：真 watcher 武装后应为"在听"，实际 deaf=${hearing.deaf}`);
+
+    hook('SessionStart', { session_id: NEW_S, cwd: '/p/agent-com', session_title: '新', source: 'resume' },
+      { ...h, tuiPid: pid });
+    const afterResume = query(h, 'SELECT session_id, watcher_pid FROM presence')[0];
+    assert(afterResume.session_id === NEW_S && afterResume.watcher_pid === w.pid,
+      `resume 同一会话不许清 watcher 登记，实际 ${JSON.stringify(afterResume)}`);
+    const stillHearing = JSON.parse(cli(['whoami', '--json', '--tui-pid', String(pid)], h).stdout);
+    assert(stillHearing.deaf === null,
+      `resume 后 deaf 必须仍是 null（在听），实际 ${stillHearing.deaf}——报成 'never' 会让 agent 再武装一个 watcher`);
+    console.log('✓ resume 同一会话：watcher 登记与 deaf（在听）都保留，自愈逻辑不会重复武装');
+  } finally {
+    const exited = new Promise(r => w.on('exit', r));
+    w.kill('SIGTERM');
+    await exited;
+  }
 }
 
 /** 一个只记录自己被调用的 `node` 桩：用来直接观察预检有没有进入 `exec node` 分支。 */
