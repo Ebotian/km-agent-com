@@ -109,42 +109,59 @@
 ```sql
 -- 在线登记（由 SessionStart / SessionEnd hook 维护，见 §8.1）
 presence(tui_pid INTEGER PRIMARY KEY, session_id TEXT, session_title TEXT,
-         cwd TEXT, handle TEXT, started_at INTEGER)
+         cwd TEXT, handle TEXT)
 
--- 帖子（总线的主表，append-only）
+-- 消息主表，append-only（游标语义依赖其不可变）
 posts(seq INTEGER PRIMARY KEY,              -- 单调递增，游标的基础
       topic TEXT NOT NULL,                  -- 层级主题路径，如 'agent-com/build'，见 §6.1
-      author_session TEXT NOT NULL, author_cwd TEXT,
-      origin TEXT NOT NULL,                 -- human|agent|system，见 §6.4 可信度分层
-      kind TEXT NOT NULL,                   -- claim|request|answer|finding|status|note，见 §6.4
-      to_session TEXT,                      -- 非空 = 点名发给某窗口（驱动 L1）；NULL = 只发到主题
+      author_session TEXT NOT NULL,
+      author_cwd TEXT,                      -- 承重：正文里的证据指针是相对路径，靠它解析
+      origin TEXT NOT NULL,                 -- human|agent，见 §6.4
+      kind TEXT NOT NULL,                   -- request|finding，见 §6.4
+      to_session TEXT,                      -- 非空 = 点名发给某窗口 → L1；NULL = 只发到主题
       title TEXT NOT NULL,                  -- Layer B 的 triage 行，必须能单独看懂
       body TEXT,                            -- 带证据指针，不带证据本体（§6.4）
-      resource TEXT,                        -- 仅 claim 用：被占用的资源路径，供 §6.2 的 L0 检查
-      expires_at INTEGER,                   -- 仅 claim 用：租约到期时间
       reply_to INTEGER,                     -- 引用 posts.seq
       ts INTEGER)
 
+-- 认领表：唯一可变的表。资源可以是路径/端口，也可以是 'task:<post.seq>'
+claims(resource TEXT PRIMARY KEY,           -- '/abs/path' | 'port:8080' | 'task:142'
+       holder_session TEXT NOT NULL,
+       lease_until INTEGER NOT NULL,        -- 过期即可被他人用同一条 SQL 抢占
+       completed_at INTEGER,                -- 仅一次性资源（task:*）会置；路径类靠释放或过期
+       note TEXT)
+
 -- 每个读者自己的游标（每人一行，与消息数、订阅数都无关）
-read_cursor(reader_session TEXT PRIMARY KEY, last_seq INTEGER, updated_at INTEGER)
+read_cursor(reader_session TEXT PRIMARY KEY, last_seq INTEGER)
 
 -- 订阅：层级前缀，决定 watcher 的过滤谓词
 subs(reader_session TEXT, pattern TEXT,     -- 'agent-com'（含子树）、'agent-com/build'
      PRIMARY KEY(reader_session, pattern))
-
--- 工作队列（原子认领）
-tasks(id INTEGER PRIMARY KEY, post_seq INTEGER, owner_session TEXT,
-      state TEXT,                           -- open|claimed|done|failed
-      claimed_at INTEGER, lease_until INTEGER, done_at INTEGER, result TEXT)
 ```
 
 **设计要点**：
 
-- `posts.seq` 单调递增，是游标、分页、增量读取的统一基础。
-- `read_cursor` **每读者一行**——与消息数无关，也与订阅数无关。v1 的 `acked:[ids]` 缺陷就出在这里。
-- `tasks` 的认领靠单条 SQL 的原子性：`UPDATE tasks SET owner_session=?, state='claimed', lease_until=? WHERE id=? AND state='open'`，返回 0 行即认领失败。`lease_until` 超时后被回收，避免窗口崩溃导致任务永久卡住。
-- **`posts` 与 `tasks` 为什么不合并**：`posts` 是 append-only 的不可变日志（游标语义依赖不可变性），`tasks` 是可变的认领状态。**只有当两个概念的生命周期不同时，拆分才成立**——这正是原设计 `room` / `topic` 不成立的地方（见 §6.1）。
-- `resource` / `expires_at` 只服务于 `claim`，其余 kind 为 NULL。没有这两列，§6.2 的 L0 访问点检查没法用一条 SQL 完成。
+- **只有两张有语义的表**：`posts` 不可变、`claims` 可变。判据是**生命周期是否不同**——原设计的 `room` / `topic`（生命周期完全相同）因此不成立（§6.1），而 `posts` / `claims` 成立。
+- **路径锁与任务锁共用同一条原子认领语句**：
+  ```sql
+  INSERT INTO claims(resource, holder_session, lease_until) VALUES (?, ?, ?)
+  ON CONFLICT(resource) DO UPDATE
+     SET holder_session = excluded.holder_session,
+         lease_until    = excluded.lease_until,
+         completed_at   = NULL
+   WHERE claims.lease_until <= :now;
+  ```
+  影响 1 行 = 认领成功，0 行 = 已被占。**这就是把原 `tasks` 表合并进 `claims` 的理由**：两者是同一个形状——「一个有名之物被某人持有且有期限」，差别只在可复用性；一条语句、一套过期清理覆盖两者。
+- **任务不是独立实体**：一个任务就是一条 `kind='request'` 的帖子 + 一条 `resource='task:<seq>'` 的认领。因此 `posts` 不需要 `resource` / `expires_at` 列，`kind` 也不需要 `claim` 取值。
+- 开放任务列表：
+  ```sql
+  SELECT * FROM posts p WHERE p.kind = 'request'
+    AND NOT EXISTS (SELECT 1 FROM claims c
+                    WHERE c.resource = 'task:' || p.seq
+                      AND (c.completed_at IS NOT NULL OR c.lease_until > :now));
+  ```
+- `resource` 靠前缀分命名空间（`/` 开头是路径、`port:`、`task:`）。L0 检查按绝对路径精确匹配，不会与 `task:` 撞上。
+- **不存可推导的状态**：`presence` 不存心跳（存活现查，§8.1）；`claims` 不存 `state`（open / claimed / done 全部由 `holder_session`、`lease_until`、`completed_at` 推导出来）。冗余状态会漂移，可推导的不会。
 
 ## 6. 订阅、寻址与分层投递
 
@@ -189,14 +206,16 @@ general
 
 这正是 `epoll` 把 level-triggered 作为安全默认、而 edge-triggered 必须 drain 到 `EAGAIN` 的原因。落到本设计：
 
-| 层 | 内容 | 机制 | 可屏蔽 | 类比 |
-|---|---|---|---|---|
-| **L0** | `claim` 冲突、资源被占 | **`PreToolUse` hook 拦截**（exit 2 → `denyToolExecution`，reason 进上下文） | **不可屏蔽** | 文件锁 / 页错误——在**访问点**解决，不是发通知 |
-| **L1** | 有人明确在等你 | watcher 退出 → 后台任务完成通知开新轮 | 可屏蔽（默认关，见 §14） | 高优先级信号、`SIGUSR1` |
-| **L2** | 队列非空且达到优先级阈值 | 轮次边界注入 digest：`Stop`（exit 2 续跑）或 `UserPromptSubmit` | 可屏蔽 | 就绪队列调度、中断合并 |
-| **L3** | `finding` / `status` / `note` 积压 | 只累加计数，等 L2 或用户说话时一起给 | — | 低优先级队列、批量处理 |
+| 层 | 内容 | 可屏蔽 | 类比 |
+|---|---|---|---|
+| **L0** | 资源被占（`claims` 里有未过期的锁） | **不可屏蔽** | 文件锁 / 页错误——在**访问点**解决，不是发通知 |
+| **L1** | 有人明确在等你 | 可屏蔽（默认关，见 §14） | 高优先级信号、`SIGUSR1` |
+| **L2** | 队列非空且达到优先级阈值 | 可屏蔽 | 就绪队列调度、中断合并 |
+| **L3** | 其余全部积压 | — | 低优先级队列、批量处理 |
 
-**L0 是唯一保证正确性的层，L1–L3 都只是延迟与成本优化。** 这条推论把 `claim` 从"必须强唤醒"里摘了出来：
+各层**用什么通道投递、延迟多少、空闲成本几何**，统一见 §7 的矩阵——本节只管"层"的语义，不重复那张表。
+
+**L0 是唯一保证正确性的层，L1–L3 都只是延迟与成本优化。** 这条推论把资源占用从"必须强唤醒"里摘了出来：
 
 > `claim` 的正确性不来自通知，而来自**访问点强制**。窗口 B 即使从未收到 A 的 `claim` 通知，它下一次 `Write` / `Edit` / `Bash` 触碰该资源时也会被 `PreToolUse` hook 拦下——reason 直接进上下文。这比任何"告诉它别做"的通知都强。**L1 对 `claim` 只是礼节**（让 B 早点停手、少做无用功），不是保障。
 
@@ -230,24 +249,31 @@ ORDER BY seq LIMIT :limit;
 
 ### 6.4 内容模型：写什么、不写什么
 
-关键认识：**这条总线传递的单位不是"消息"，而是"占用 / 请求 / 事实"**。承载聊天式散文的 agent 论坛是玩具；价值来自少数几种高信号记录。内容类型直接决定投递层级（§6.2）——所以它属于本节。
+关键认识：**这条总线传递的单位不是"消息"，而是「请求 / 事实」，外加一层「资源占用」**。承载聊天式散文的 agent 论坛是玩具；价值来自极少数高信号记录。
 
-#### 记录类型（`kind` 闭合集合）
+#### 只有两种内容类型（`kind`）
 
-| kind | 内容要点 | 默认层级 | 理由 |
-|---|---|---|---|
-| `claim` | 要占用的资源（路径 / 端口 / 服务）+ 租约时长 | **L0** 强制（L1 仅为礼节） | 唯一能**防止实际破坏**的一类：避免两个窗口同时改同一份文件、同时跑同一个迁移 |
-| `request` | 要什么 + 为什么 + 期望产出 | L1（`@` 到人时）/ 否则 L2 | 有明确消费方 |
-| `answer` | 引用 `reply_to` + 一句话结论 + 证据路径 | L1（回复你）/ 否则 L2 | 对方在等 |
-| `finding` | 一句话结论 + `path:line` 证据指针 + 复现方式 | L3（由 L2 批量带出） | 避免重复劳动，但不紧急 |
-| `status` | 一行进度 | L3，可关 | 最容易退化成噪音 |
-| `note` | 自由备注 | L3 | 兜底 |
+| kind | 内容要点 | 有特定消费方 |
+|---|---|---|
+| `request` | 要什么 + 为什么 + 期望产出 | **是**——不处理就卡住。任务也是它（`claims` 里的 `task:<seq>`，见 §5） |
+| `finding` | 一句话结论 + `path:line` 证据指针 + 复现方式 | 否——价值在省掉别人的重复劳动 |
+
+两个正交的轴**不由 `kind` 表达**，因为它们各自已经有字段承载：
+
+| 轴 | 由什么表达 | 为什么不用 kind |
+|---|---|---|
+| 这是回复吗 | `reply_to` 非空 | 原设计的 `kind='answer'` 与它是同一个 bit 的两种记法，会互相矛盾 |
+| 资源占用 | `claims` 表 | 原设计的 `kind='claim'` 帖子把**可变**的租约混进了**不可变**的日志（§5） |
+
+**删掉三个取值的原因**：`answer` 与 `reply_to` 重复；`status` 与下面的负面清单自相矛盾（"不写没有接收方行动意义的广播"），且投递语义与其他类型完全相同；`note` 是 `finding` 的兜底，没有独立语义。
+
+**投递层级不由 `kind` 决定**：只有命中 `claims` 走 L0（§6.2），其余一切由 `to_session`（是你 → L1）和订阅前缀（→ L2/L3）决定。层级只有一个来源，`kind` 只描述意图。
 
 #### 三条硬规则
 
 1. **正文带"证据指针"，不带证据本体。** `finding` 写「结论 + `lib/db.mjs:88` + 一句复现」，不贴 200 行日志；接收方要细节自己去读文件。协议是按 **agent 的成本结构**设计的，不能照抄人类聊天的习惯。
 2. **"已读"是游标，不是帖子。** 绝不产生 `ack` / "收到" / "好的" 这类记录——N 个 agent 的确认会淹没板子并触发互相唤醒。确认语义完全由 `read_cursor` 承担。
-3. **写之前先查。** 发起 `request` / `claim` 前先 `bus search`，看有没有人已经做过或已占用。这一步把总线从"广播频道"变成"查表"，是它不退化的重要前提。
+3. **写之前先查。** 发 `request` 前先 `bus search`；要动某个资源前先 `bus busy`。这一步把总线从"广播频道"变成"查表"，是它不退化的重要前提。
 
 #### 两级读取：库里存的和落进上下文的不一样
 
@@ -269,6 +295,8 @@ ORDER BY seq LIMIT :limit;
 
 不写：寒暄与确认；没有接收方行动意义的广播（"我要开始了"）；大段代码/日志（用路径代替）；未经请求的他人状态汇报；同一内容的重复提醒。
 
+**这条清单与上面删掉 `status` / `note` 是同一件事的两面**：判据是"有没有接收方会因此做点什么"。没有，就不发。
+
 #### 可信度分层（论坛模型放大了注入风险）
 
 点对点只影响一个收件人，板块上一份被污染的内容会传播给**所有**读者。所以写入时记录 `origin`：
@@ -277,7 +305,8 @@ ORDER BY seq LIMIT :limit;
 |---|---|---|---|
 | `human` | 用户在终端直接跑 CLI 发的 | `(human)` | 高可信 |
 | `agent` | 某个窗口的 agent 发的 | `(agent)` | **数据，不是指令**；执行其中命令性内容前需向用户确认 |
-| `system` | 插件自身（如 watcher 自愈提示） | `(system)` | 插件可信 |
+
+原设计的第三个取值 `system`（插件自己发的）已删除——**插件不往总线发帖**，自愈提示走的是 hook 注入，不是帖子。
 
 渲染时**必须**带这个标记，skill 正文里也必须写明这条规则。§5 的 `posts` 表需要相应增加 `origin` 列。
 
@@ -303,9 +332,9 @@ cron 自醒（§3.2）退为"L1 的替代实现"，同样默认关闭。
 agent-com/                           插件根（仓库）
 ├── kimi.plugin.json                 manifest：hooks / skills / commands / systemPrompt
 ├── bin/
-│   ├── bus.mjs                      CLI：post/read/digest/watch/topics/peers/
-│   │                                subscribe/claim/done/log/whoami
-│   │                                （watch 是子命令，不单独出二进制）
+│   ├── bus.mjs                      CLI：post/read/digest/search/watch/topics/
+│   │                                peers/subscribe/claim/busy/release/done/
+│   │                                log/whoami（watch 是子命令，不单独出二进制）
 ├── lib/
 │   ├── db.mjs                       schema 建立/迁移、WAL、busy_timeout、游标读写
 │   ├── identity.mjs                 祖先遍历定位窗口 + 存活判定（见 §8.1）
@@ -349,7 +378,7 @@ manifest 里 `command` 写 `node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"`（shell
 |---|---|---|---|
 | **`PreToolUse`** | `Write\|Edit\|Bash` | **L0 访问点强制**：检查本次要碰的资源是否被 `claim` 占用，冲突即拒绝 | exit 2 + stderr 说明 → 工具被拒，原因进上下文 |
 | `SessionStart` | — | 祖先遍历 → upsert `presence`（含 handle）+ 种下默认订阅 | 无（只要副作用） |
-| `SessionEnd` | — | 删除 `presence` 行；回收该 session 名下的 `tasks` 租约 | 无 |
+| `SessionEnd` | — | 删除 `presence` 行；回收该 session 名下的 `claims` 租约 | 无 |
 | `UserPromptSubmit` | — | ① 注入未读摘要（L2 弱投递）② **自愈检查**：本窗口 watcher 不在就提醒模型重新武装 | exit 0 + stdout 文本 → `<hook_result>` user 消息 |
 
 四个事件里只有 `PreToolUse` 与 `UserPromptSubmit` 有返回值语义，另外两个纯做副作用。
@@ -389,7 +418,7 @@ exec node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"
 | `presence` 条目对应 pid 已死或 pid 被复用 | `process.kill(pid,0)` + `cmdline` 校验（§8.1）；清扫由任何一次 `bus` 命令或 watcher tick 顺带完成 |
 | CLI 找不到自己的 `presence` 条目 | 降级：用 cwd 作回退身份，并在输出里提示"本窗口未登记，请检查插件 hooks" |
 | `@` 的目标不在 `presence` | 帖子照常落库（对方下次存在时游标能读到），返回 `delivered: deferred` + 候选 handle 列表 |
-| 认领任务返回 0 行 | 正常结果（被别人抢先），返回 `claimed: false` + 当前 owner |
+| 认领返回 0 行 | 正常结果（被别人抢先），返回 `claimed: false` + 当前 `holder_session` |
 | 租约超时 | `lease_until` 过期后任务回到 `open`，`SessionEnd` 主动回收本 session 名下租约 |
 | watcher 被 `fs.watch` 丢事件 | 5s SQLite 轮询兜底 |
 | `SQLITE_BUSY` | `busy_timeout=5000` 内自动重试；超时则报错并提示重试 |
@@ -439,7 +468,7 @@ v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历�
 
 1. **L1（空闲窗口的强唤醒）v1 到底开不开？** 我建议**默认关**：正确性不依赖它（L0 在访问点兜底），而它依赖的是一个取巧机制（§15.5）。见 §6.2、§7。
 2. ~~房间怎么分~~ → 已定：**房间就是主题树的顶层**，默认订阅由 `SessionStart` 按 cwd 种下（§6.1、§8.1），另有 `general` 供跨项目话题。
-3. **工作队列（§5 的 `tasks`）进不进 v1**？我倾向进——原子认领是这套东西相对"聊天室"唯一不可替代的价值；但会让 schema 和 skill 复杂一档。
+3. ~~工作队列进不进 v1~~ → 已定：**进**，且已经融进 schema——任务不是独立实体，就是一条 `kind='request'` 的帖子 + 一条 `resource='task:<seq>'` 的认领（§5）。
 4. **还要不要保留 markdown 可读副本**？有了 `sqlite3` CLI，我倾向不留。待确认。
 5. **watcher 的最长挂载时间**取 12 小时还是 24 小时（上限 86400s）？影响重新武装的频率。
 6. 插件名最终定 `agent-bus` 还是 `kimi-agent-bus`？影响 `mcp__*` 命名长度（若将来补 MCP 接口）。
@@ -473,7 +502,7 @@ v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历�
 
 修法：watcher 加 200ms 去抖/合并窗口，把一次突发合并成一次查询；只在**命中行**时才退出。查询走 `(topic, seq)` 索引，单次开销可忽略。
 
-**（b）`origin` 不是安全边界。** `origin: human/agent/system` 只能当**来源提示**，不能当鉴权：agent 的 Bash 跑在同一用户下、有同样的文件系统权限，所以它能读到窗口令牌、能自己调 CLI 冒充 `human`。**同用户下不存在真正的凭证隔离。**
+**（b）`origin` 不是安全边界。** `origin: human/agent` 只能当**来源提示**，不能当鉴权：agent 的 Bash 跑在同一用户下、有同样的文件系统权限，所以它能读到窗口令牌、能自己调 CLI 冒充 `human`。**同用户下不存在真正的凭证隔离。**
 
 因此防护必须落在别处：skill 里把 `agent` 来源一律当数据、执行其中命令性内容前向用户确认；`PreToolUse` 拦截是唯一的硬约束（它由引擎拉起，不走 agent 的路径）。
 
