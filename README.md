@@ -2,8 +2,10 @@
 
 > 让本机不同窗口里各自运行的 Kimi Code agent 互相通信。
 
-**状态：设计阶段**——尚无实现代码。完整设计见
-[`docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md`](docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md)。
+**状态：已实现**——`lib/` / `bin/` / `hooks/` / manifest+skill 全部落地，`node test/e2e.mjs` 在临时 home 里
+跑通整条链路（窗口登记 → L0 拦截 → `@` 唤醒 → 原子认领 → 完结）。完整设计见
+[`docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md`](docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md)，
+安装见 [`docs/install.md`](docs/install.md)。
 
 ## 要解决的问题
 
@@ -43,11 +45,19 @@ Kimi Code 的每个窗口是一个独立的 `kimi-code` 进程，各自持有全
 | 层 | 内容 | 机制 | 可屏蔽 |
 |---|---|---|---|
 | **L0** | 资源被占 | `PreToolUse` hook 拒绝工具调用，原因进上下文 | **不可屏蔽** |
-| **L1** | 有人 `@你` | 后台 watcher 退出 → 后台任务完成通知开新轮 | 可屏蔽，**默认开** |
-| **L2** | 队列达阈值 | 轮次边界注入摘要：`Stop` / `UserPromptSubmit` | 可屏蔽 |
-| **L3** | 其余积压 | 只累加计数，等下次交互排空 | — |
+| **L1** | 有人 `@你` | 后台 watcher 退出 → 后台任务完成通知开新轮（单轮上限 50 条，超出的下轮继续） | 可屏蔽，**默认开** |
+| **L2** | 队列达阈值 | 轮次边界注入摘要：`UserPromptSubmit`（用户回到窗口时） | 可屏蔽 |
+| **L3** | 其余积压 | triage 行随下一次交互投出（单轮上限 10 条，超出的下轮继续） | — |
 
-**L0 是唯一保证正确性的层。** 一个窗口即使从未收到占用通知，它下次触碰该资源时也会被 `PreToolUse` 拦下——这比任何"告诉它别做"的通知都强。所以关掉 L1 只损失响应速度，**不损失正确性**。
+**L0 是唯一的硬约束**——别的都是通知，只有它让操作**做不成**。但它的覆盖范围必须说准：
+
+- 对 `Write` / `Edit` 是**精确**的（`tool_input.path` 按 `cwd` 归一化后与 `claims.resource` 逐字符比较）；
+- 对 `Bash` 是**启发式**的（从命令文本里抠路径：绝对路径、`./`/`../`、含 `/` 的词、重定向目标）——抠不出来就放行，并且现在会留一行 `pretooluse-no-path` 审计；
+- 资源是**精确字符串**：不覆盖子树、不认软链、也不追溯 `..` 之外的别名。**动敏感资源前先 `busy` 查一次。**
+
+一个窗口即使从未收到占用通知，它下次触碰该资源时也会被 `PreToolUse` 拦下——这比任何"告诉它别做"的通知都强。所以关掉 L1 只损失响应速度，**不损失正确性**。
+
+**L2 只走 `UserPromptSubmit`**（用户回到该窗口的那一刻）。**正在跑一轮的窗口不会在回合边界收到摘要**：引擎里唯一能在回合边界把内容注入上下文的另一个事件是 `Stop`，而它的退出码语义是**阻止收尾并强制续跑**——多花一次模型调用，与本设计"抑制投递"的成本模型正好相反。所以本实现不注册它，忙窗口的积压推迟到下一次用户轮次（L2 本就是可屏蔽的延时优化，正确性不依赖它）。
 
 ### 数据模型：只有两张有语义的表
 
@@ -60,10 +70,12 @@ Kimi Code 的每个窗口是一个独立的 `kimi-code` 进程，各自持有全
 
 ```sql
 INSERT INTO claims(resource, holder_session, lease_until) VALUES (?, ?, ?)
-ON CONFLICT(resource) DO UPDATE SET ... WHERE claims.lease_until <= :now;
+ON CONFLICT(resource) DO UPDATE SET ...
+ WHERE (claims.completed_at IS NULL AND claims.lease_until <= :now)
+    OR (claims.completed_at IS NULL AND claims.holder_session = :holder);
 ```
 
-影响 1 行 = 认领成功，0 行 = 已被占。**任务因此不是独立实体**——它就是一条帖子加一条认领。
+影响 1 行 = 认领成功，0 行 = 已被占。**已完成的行永不可再被认领**（否则一次性任务会重新入队）。**任务因此不是独立实体**——它就是一条帖子加一条认领。
 
 同理，可推导的状态一律不存：存活不存心跳（`/proc` 现查）、认领不存 `state`（由 `holder_session` / `lease_until` / `completed_at` 推导）。冗余状态会漂移，可推导的不会。
 
@@ -92,8 +104,8 @@ ON CONFLICT(resource) DO UPDATE SET ... WHERE claims.lease_until <= :now;
 - [x] 成本实测：单次唤醒的上下文规模与频率权衡
 - [x] 设计文档：分层投递、数据模型、内容模型、IPC 谱系定位
 - [x] 冗余清理：`room`/`topic` 合并为层级主题；存活判定去重；`tasks` 并入 `claims`；`kind` 由 6 种收敛到 2 种
-- [ ] 接口冻结 → 出实施计划
-- [ ] 实现（存储层 / 身份解析 / CLI / watcher / hooks / manifest+skill / 测试）
+- [x] 接口冻结 → 出实施计划
+- [x] 实现（存储层 / 身份解析 / CLI / watcher / hooks / manifest+skill / 测试）
 
 ## 已定的决定
 
@@ -110,7 +122,12 @@ ON CONFLICT(resource) DO UPDATE SET ... WHERE claims.lease_until <= :now;
 
 **插件 id 是 `agent-bus`**：数据目录 `~/.kimi-code/agent-bus/`，斜杠命令 `/agent-bus:peers`、`:watch`、`:digest`。仓库名 `km-agent-com` 与插件 id 无关，manifest 里的 `name` 才是身份。
 
-**接口已冻结**（§5 schema / §6.3 过滤谓词 / §8 组件边界）。下一步是实施计划。
+**接口已冻结**（§5 schema / §6.3 过滤谓词 / §8 组件边界），实现已完成（`lib/` / `bin/` / `hooks/` / manifest+skill / `test/`）。
+
+## 安装
+
+见 [`docs/install.md`](docs/install.md)。需要 **Node.js ≥ 22.13.0**（内建 `node:sqlite` 从这一版起默认可用；
+22.5.0–22.12.x 仍需要 `--experimental-sqlite`，而 hook 命令不带这个 flag，CLI 与四个 hook 会**一起静默失效**）。
 
 ## 许可
 

@@ -1,0 +1,39 @@
+{
+  "name": "agent-bus",
+  "version": "0.1.0",
+  "description": "本机不同窗口的 Kimi Code agent 之间的消息总线：主题订阅、资源互斥、工作队列。",
+  "keywords": ["multi-agent", "ipc", "bus", "sqlite"],
+  "license": "AGPL-3.0",
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "hooks": [
+    {
+      "event": "PreToolUse",
+      "matcher": "Write|Edit|Bash",
+      "command": "[ -f \"${KIMI_CODE_HOME:-$HOME/.kimi-code}/agent-bus/claims.marker\" ] || exit 0\nexec node \"$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs\"",
+      "timeout": 5
+    },
+    {
+      "event": "SessionStart",
+      "command": "node \"$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs\"",
+      "timeout": 10
+    },
+    {
+      "event": "SessionEnd",
+      "command": "node \"$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs\"",
+      "timeout": 10
+    },
+    {
+      "event": "UserPromptSubmit",
+      "command": "node \"$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs\"",
+      "timeout": 10
+    }
+  ],
+  "interface": {
+    "displayName": "Agent Bus",
+    "shortDescription": "本机跨窗口 agent 消息总线",
+    "longDescription": "用 SQLite 做共享状态，让本机不同窗口里的 agent 能按主题订阅、互相点名、对资源做访问点互斥、并原子认领任务。",
+    "developerName": "Ebotian",
+    "websiteURL": "https://github.com/Ebotian/km-agent-com"
+  }
+}
