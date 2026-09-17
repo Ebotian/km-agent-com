@@ -150,7 +150,7 @@ subs(reader_session TEXT, pattern TEXT,     -- 'agent-com'（含子树）、'age
 | `NOT NULL` | `subs.reader_session` / `subs.pattern` | 两者同为主键，缺一不可 |
 | `CHECK (origin IN ('human','agent'))` | `posts.origin` | 依据 §6.4：取值域是**闭合**的——原设计的第三个取值 `system` 已删除（插件不往总线发帖） |
 | `CHECK (kind IN ('request','finding'))` | `posts.kind` | 依据 §6.4：只有两种内容类型，`answer` / `status` / `note` 三个取值已删除 |
-| 索引 `posts_topic_seq(topic, seq)` | `posts` | 依据 §6.1：订阅谓词 `topic = pattern OR topic LIKE pattern || '/%'` **可以走索引**；第二列 `seq` 支撑按主题的游标顺序扫描 |
+| 索引 `posts_topic_seq(topic, seq)` | `posts` | 依据 §6.1：订阅谓词是 `topic = pattern OR substr(topic, 1, length(pattern) + 1) = pattern || '/'`（为什么**不用 `LIKE`** 见 §6.1）；该索引是这两列的覆盖索引，第二列 `seq` 支撑按主题的游标顺序扫描 |
 
 **方向是"更严"，不是"不同"**：列名与列序与上面的 SQL 块逐字一致，这里只是把原先仅写在注释里的取值域、以及隐含的非空前提，提升为强制约束。因此按 SQL 块以为可以传 NULL 的调用方会在运行时报错（`node:sqlite` 把未绑定的 `undefined` 绑成 NULL，漏传参数同样会撞上 NOT NULL）。
 
@@ -212,7 +212,7 @@ general
 2. `@everyone` 不再需要"默认禁止"——默认订阅集里没有 `all`，它默认就是空投。
 3. 一条帖子要同时表达"房间"和"主题"，原设计要填 `room` + `topic` 两个字段，现在**只用一个**（`agent-com/build`）。
 
-**通配只支持尾部**：`pattern='agent-com'` 含整棵子树，`pattern='agent-com/build'` 只含自身。实现是 `topic = pattern OR topic LIKE pattern || '/%'`，**可以走索引**。单层通配（如 `*/build`）不做——跨项目的同名主题兴趣很罕见；真需要时加 `post_tags` 关联表，而不是把主查询路径搞复杂。
+**通配只支持尾部**：`pattern='agent-com'` 含整棵子树，`pattern='agent-com/build'` 只含自身。实现是 `topic = pattern OR substr(topic, 1, length(pattern) + 1) = pattern || '/'`——**不用 `LIKE`**，因为 `LIKE` 会把主题里合法的 `_` 当成单字符通配符（`normalizeTopic` 放行 `_` 且不转义），`pattern='a_b'` 于是会误匹配 `aXb`。单层通配（如 `*/build`）不做——跨项目的同名主题兴趣很罕见；真需要时加 `post_tags` 关联表，而不是把主查询路径搞复杂。
 
 **不做访问控制**：`subs` 本来就是读者自己声明的，原设计里 `room` 也没提供任何强制隔离（写一条 `subs` 记录就能读"别的房间"）。而按 §15.3，同用户下不存在真正的凭证隔离——所以在这里加"房间权限"只会是安全戏法。
 
@@ -255,11 +255,13 @@ WHERE seq > :my_cursor
           SELECT 1 FROM subs s
           WHERE s.reader_session = :me
             AND (posts.topic = s.pattern
-                 OR posts.topic LIKE s.pattern || '/%')
+                 OR substr(posts.topic, 1, length(s.pattern) + 1) = s.pattern || '/')
         )
       )
 ORDER BY seq LIMIT :limit;
 ```
+
+**为什么用 `substr` 而不是 `LIKE`**：`LIKE` 把 `_` 当单字符通配符、把 `%` 当任意串，而主题里 `_` 是合法字符（`normalizeTopic` 放行且不转义），于是 `pattern='a_b'` 会误匹配 `aXb`，把不该投递的帖子算进投递范围。`substr(posts.topic, 1, length(s.pattern) + 1) = s.pattern || '/'` 是逐字符的精确前缀比较，与 `lib/topic.mjs` 的 `matches(pattern, topic)` 逐字等价。
 
 **判断强/弱**：结果里存在任一条 `to_session = :me` → L1 强唤醒（watcher 退出）；否则只累加未读计数，watcher 继续等。
 
