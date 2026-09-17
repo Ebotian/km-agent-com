@@ -1,15 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openDb } from '../lib/db.mjs';
 import * as id from '../lib/identity.mjs';
 import * as posts from '../lib/posts.mjs';
-import { CLI, makeTmpHome, cleanup, runCli } from './helpers.mjs';
+import { CLI, makeTmpHome, cleanup, runCli, seedWindow } from './helpers.mjs';
 
 /**
- * 造一棵假 /proc（不跨测试文件 import，保持本文件自足）。
+ * 造一棵假 /proc（不跨测试文件 import，保持本文件自足）——只给**故意不成对**的用例用：
+ * 比如「pid 不在 /proc 里的窗口行应被清扫」。正常种窗口一律走 helpers.seedWindow。
  * `/proc/<pid>/cmdline` 的真实格式是「每个 argv 元素一个 NUL 终止符」，
  * 所以填充时必须整体追加一个 `\0`，而不是逐字符插 NUL。
  */
@@ -25,23 +26,16 @@ function seedProc(root, entries) {
 /**
  * 窗口 me/other 与 me 的 watcher 都必须落在假 /proc 里：
  * watcherPid 用 process.pid 是失真的——那是测试进程，cmdline 不是 bus.mjs watch，
- * `deaf` 会被正确判成 'dead' 而非 null。
+ * `deaf` 会被正确判成 'dead' 而非 null。成对由 seedWindow 保证（见 helpers.mjs）。
  */
 function seedHome() {
   const home = makeTmpHome();
-  const procRoot = join(home, 'proc');
-  seedProc(procRoot, [
-    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
-    { pid: 200, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
-    { pid: 500, comm: 'node', ppid: 100, cmdline: 'node /x/bin/bus.mjs watch --session me' },
-  ]);
-
-  const db = openDb(join(home, 'agent-bus', 'bus.db'));
-  id.upsertPresence(db, { tuiPid: 100, sessionId: 'me', sessionTitle: 'A', cwd: '/p/agent-com', handle: 'agent-com' });
-  id.setWatcher(db, { tuiPid: 100, watcherPid: 500, watcherUntil: 9e15 });
-  id.upsertPresence(db, { tuiPid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
-  posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
-  db.close();
+  const procRoot = seedWindow(home, {
+    pid: 100, sessionId: 'me', sessionTitle: 'A', cwd: '/p/agent-com',
+    handle: 'agent-com', subscribes: ['agent-com'],
+    watcherPid: 500, watcherUntil: 9e15,
+  });
+  seedWindow(home, { pid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
   return { home, procRoot };
 }
 
@@ -51,15 +45,10 @@ function seedHome() {
  */
 function seedBigHandleHome() {
   const home = makeTmpHome();
-  const procRoot = join(home, 'proc');
-  seedProc(procRoot, [
-    { pid: 200, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
-    { pid: 300, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
-  ]);
-  const db = openDb(join(home, 'agent-bus', 'bus.db'));
-  id.upsertPresence(db, { tuiPid: 300, sessionId: 'big', sessionTitle: 'big', cwd: '/p/big', handle: 'h'.repeat(256 * 1024) });
-  id.upsertPresence(db, { tuiPid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
-  db.close();
+  const procRoot = seedWindow(home, {
+    pid: 300, sessionId: 'big', sessionTitle: 'big', cwd: '/p/big', handle: 'h'.repeat(256 * 1024),
+  });
+  seedWindow(home, { pid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
   return { home, procRoot };
 }
 
@@ -434,4 +423,77 @@ test('冲突路径上超过管道缓冲的 stdout 也被完整写出（用 exitC
     assert.equal(r.stdout.endsWith('\n'), true, '整行都写完了');
     assert.ok(r.stderr.length > 256 * 1024, `stderr 同样被截断（${r.stderr.length} 字节）`);
   } finally { cleanup(home); }
+});
+
+// —— R-P2：三条同族加固（见 task-9 裁决）——
+
+test('--ttl 0 与荒谬上界在写库之前就被拒，资源不被污染', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    // 0ms：claim 会返回 claimed:true 但租约当场过期（幽灵成功）。
+    // 99999999999h：lease_until ≈ 3.6e17，过了写库，随后的成功文案 toISOString 抛
+    // RangeError ⇒ 成功被报成 exit 1，且该资源此后任何 busy/claim 都崩（中毒资源）。
+    for (const ttl of ['0', '0ms', '99999999999h', '400d', '99999999999999999999999ms']) {
+      const r = runCli(['claim', '/p/t-ghost', '--ttl', ttl, '--session', 'me', '--home', home], { home, procRoot });
+      assert.equal(r.status, 1, `--ttl ${ttl} 应被拒，实际 ${r.status}`);
+      assert.match(r.stderr, /ttl/, `--ttl ${ttl} 的错误文案要能自查`);
+    }
+
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM claims WHERE resource = ?').get('/p/t-ghost').n, 0,
+      '拒绝必须发生在写库之前：一行租约都不能留下');
+    db.close();
+
+    assert.equal(runCli(['busy', '/p/t-ghost', '--session', 'me', '--home', home], { home, procRoot }).status, 0,
+      '被拒之后资源仍应是空闲（不能变成既不是 2 也不是 0 的状态）');
+    assert.equal(runCli(['claim', '/p/t-ghost', '--ttl', '30m', '--session', 'me', '--home', home], { home, procRoot }).status, 0);
+
+    // 上界本身必须还能用：8760h = 365 天正好是上限
+    const t0 = Date.now();
+    assert.equal(runCli(['claim', '/p/t-max', '--ttl', '8760h', '--session', 'me', '--home', home], { home, procRoot }).status, 0);
+    const db2 = openDb(join(home, 'agent-bus', 'bus.db'));
+    const leaseMs = db2.prepare('SELECT lease_until FROM claims WHERE resource = ?').get('/p/t-max').lease_until - t0;
+    db2.close();
+    assert.ok(leaseMs >= 31_536_000_000 && leaseMs < 31_536_005_000, `8760h 应约等于 365 天，实际 ${leaseMs}`);
+  } finally { cleanup(home); }
+});
+
+test('log 跳过非有限/超出 Date 范围的时间戳，不因坏行崩掉', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    mkdirSync(join(home, 'agent-bus'), { recursive: true });
+    writeFileSync(join(home, 'agent-bus', 'log.jsonl'), [
+      '{"ts":1e999,"actor":"x","action":"infinity","detail":"JSON.parse 得到 Infinity"}',
+      '{"ts":1e18,"actor":"x","action":"out-of-range","detail":"超出 Date 表示范围"}',
+      '{"ts":1,"actor":"me","action":"post","detail":"ok"}',
+    ].join('\n') + '\n');
+
+    const r = runCli(['log', '--json', '--home', home], { home, procRoot });
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(JSON.parse(r.stdout).map(e => e.action), ['post'], '坏行跳过，好行照读');
+    const human = runCli(['log', '--home', home], { home, procRoot });
+    assert.equal(human.status, 0);
+    assert.match(human.stdout, /ok/);
+  } finally { cleanup(home); }
+});
+
+test('非 EPIPE 的 stdout 写错误不覆盖已置的退出码，也不让失败变成功', () => {
+  const { home, procRoot } = seedHome();
+  // /dev/full 上的写必以 ENOSPC 失败，不靠时序运气。
+  const fd = openSync('/dev/full', 'w');
+  try {
+    assert.equal(runCli(['claim', '/p/agent-com/x', '--session', 'me', '--home', home], { home, procRoot }).status, 0);
+
+    const busy = spawnSync(process.execPath,
+      [CLI, 'busy', '/p/agent-com/x', '--session', 'other', '--home', home],
+      { stdio: ['ignore', fd, 'pipe'], encoding: 'utf8',
+        env: { ...process.env, KIMI_CODE_HOME: home, AGENT_BUS_PROC_ROOT: procRoot } });
+    assert.equal(busy.status, 2, `ENOSPC 不得把 busy 已置的 2 改写成 1，实际 ${busy.status}`);
+
+    const ok = spawnSync(process.execPath,
+      [CLI, 'whoami', '--session', 'me', '--home', home],
+      { stdio: ['ignore', fd, 'pipe'], encoding: 'utf8',
+        env: { ...process.env, KIMI_CODE_HOME: home, AGENT_BUS_PROC_ROOT: procRoot } });
+    assert.equal(ok.status, 1, '输出没送达就不能以 0 退出');
+  } finally { closeSync(fd); cleanup(home); }
 });
