@@ -4,7 +4,8 @@
 // 这四件事里只有 PreToolUse 保证**正确性**：它挂在访问点上，别人占了你要碰的资源就
 // 拒绝这次调用（"做不成"），比任何"通知"（"被告知别做"）都强。其余三个都是尽力而为的
 // 副作用与投递，所以整个流程 fail-open——总线一挂绝不能卡死所有窗口的工具调用。
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
 import { topicFromCwd } from '../lib/topic.mjs';
 import * as identity from '../lib/identity.mjs';
@@ -20,7 +21,16 @@ process.stderr.on('error', () => {});
 
 const EVENTS = new Set(['SessionStart', 'SessionEnd', 'PreToolUse', 'UserPromptSubmit']);
 
-const pluginRoot = process.env.KIMI_PLUGIN_ROOT || '.';
+/**
+ * 插件根**靠自定位**：从本文件的位置往上推一层（`hooks/` → 插件根）。
+ *
+ * 不读 `KIMI_PLUGIN_ROOT`：这个变量确实只注入 hook 进程，看起来够用，但它与"哪个脚本
+ * 在跑"是两个可以不一致的来源；而且写进 agent 上下文的提示行绝不能依赖"当前进程恰好
+ * 有那个变量"——CLI 侧（`bin/bus.mjs`）就是反例，agent 的 `Bash` 环境里没有它，
+ * 提示行于是退化成 `node ./bin/bus.mjs …`。同一条自定位规则在两侧各写一次，两边都只
+ * 依赖"脚本自己的位置"这一件在任何环境里都成立的事实。
+ */
+const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
  * 读 stdin 必须是**有界**的（R-T3）。契约形态下（引擎按 spec F10 pipe 进 JSON）'end'

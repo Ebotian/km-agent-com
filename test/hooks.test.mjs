@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { openDb } from '../lib/db.mjs';
 import * as identity from '../lib/identity.mjs';
 import * as claims from '../lib/claims.mjs';
@@ -248,6 +248,37 @@ test('UserPromptSubmit 在本窗口没有 presence 行时按"从未武装"提示
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /从未武装/);
     assert.match(r.stdout, /重新武装/);
+  } finally { cleanup(home); }
+});
+
+/**
+ * Bug B 的同类残留：重新武装那一行是**写进 agent 上下文**的提示，而 hook 以前拿
+ * `process.env.KIMI_PLUGIN_ROOT || '.'` 拼它的路径。hook 进程里那个变量确实有（引擎注入），
+ * 但"提示行指向哪份脚本"不该取决于"当前进程恰好有没有某个环境变量"——CLI 侧就是反例
+ * （agent 的 `Bash` 环境里没有它，同一行于是渲染成 `node ./bin/bus.mjs …`）。
+ *
+ * 现在插件根靠 hook 自己定位（`hooks/` 的上一级），所以这里**故意不设**那个变量，
+ * 断言同一行照样是**存在的绝对路径**，且往上两级算出的插件根里认得 `kimi.plugin.json`。
+ */
+test('UserPromptSubmit 的重新武装行在 KIMI_PLUGIN_ROOT 缺席时仍是存在的绝对路径', () => {
+  const home = makeTmpHome();
+  try {
+    const r = runHook(event('UserPromptSubmit'), { home, tuiPid: ME_PID, pluginRoot: null });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /重新武装/, '没有 presence 行 ⇒ 从未武装 ⇒ 必须提示重新武装');
+    assert.equal(r.stdout.includes('./bin/bus.mjs'), false,
+      `提示行不能是相对路径（agent 照抄时相对它的 cwd 解析）:\n${r.stdout}`);
+
+    const line = r.stdout.split('\n').find(l => l.includes('重新武装:'));
+    assert.ok(line, `没有重新武装行:\n${r.stdout}`);
+    const m = /重新武装: node (.+) watch --timeout 43200$/.exec(line);
+    assert.ok(m, `重新武装行必须是 node <绝对路径>/bin/bus.mjs watch --timeout 43200，实际: ${line}`);
+    assert.equal(existsSync(m[1]), true, `提示行给的脚本必须真的存在：${m[1]}`);
+    assert.equal(m[1], HOOK.replace(/[\\/]hooks[\\/]bus-hook\.mjs$/, '/bin/bus.mjs'),
+      'hook 提示的那份 CLI 必须与 hook 同属一个插件根');
+    const root = dirname(dirname(m[1]));
+    assert.equal(existsSync(join(root, 'kimi.plugin.json')), true,
+      `自定位出的插件根里必须有 kimi.plugin.json（\`..\` 的层数写对了吗）：${root}`);
   } finally { cleanup(home); }
 });
 
