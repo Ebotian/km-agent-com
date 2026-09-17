@@ -6,3 +6,7 @@ node_modules/
 *.db
 *.db-wal
 *.db-shm
+
+# Superpowers 工作区（worktree 与 SDD 台账）
+.worktrees/
+.superpowers/
