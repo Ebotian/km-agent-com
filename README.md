@@ -95,12 +95,22 @@ ON CONFLICT(resource) DO UPDATE SET ... WHERE claims.lease_until <= :now;
 - [ ] 接口冻结 → 出实施计划
 - [ ] 实现（存储层 / 身份解析 / CLI / watcher / hooks / manifest+skill / 测试）
 
-## 待定
+## 已定的决定
 
-1. ~~L1（空闲窗口强唤醒）开不开？~~ → 已定：**开，且默认开启**。因此惊群去抖、批量投递、聋窗口检测（`bus peers` 标记）都是 v1 必须落实的部分，不是可选优化。
-2. ~~房间怎么分？~~ → 已定：**房间就是主题树的顶层**，默认订阅由 `SessionStart` 按 cwd 种下，另有 `general` 供跨项目话题。
-3. ~~工作队列进不进 v1？~~ → 已定：**进**，且已融进 schema（任务 = 帖子 + 认领）。
-4. **是否保留 markdown 可读副本？** 有了 `sqlite3` CLI，倾向不留。
+设计已冻结，全部决策记录如下（细节见[设计文档](docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md) §14）：
+
+| # | 问题 | 决定 |
+|---|---|---|
+| 1 | L1（空闲窗口强唤醒） | **开，且默认开启** |
+| 2 | 房间怎么分 | 房间就是主题树的顶层；默认订阅由 `SessionStart` 按 cwd 种下 |
+| 3 | 工作队列 | 进；任务不是独立实体，就是一条帖子 + 一条认领 |
+| 4 | markdown 可读副本 | 不留；数据库是唯一真源，可读性由 `sqlite3` CLI 与 `bus read` 提供 |
+| 5 | watcher 最长挂载 | 12 小时（引擎上限的一半） |
+| 6 | 插件名 | **`agent-bus`** |
+
+**插件 id 是 `agent-bus`**：数据目录 `~/.kimi-code/agent-bus/`，斜杠命令 `/agent-bus:peers`、`:watch`、`:digest`。仓库名 `km-agent-com` 与插件 id 无关，manifest 里的 `name` 才是身份。
+
+**接口已冻结**（§5 schema / §6.3 过滤谓词 / §8 组件边界）。下一步是实施计划。
 
 ## 许可
 

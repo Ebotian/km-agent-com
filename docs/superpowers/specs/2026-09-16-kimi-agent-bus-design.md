@@ -492,14 +492,32 @@ v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历�
 7. 测试与 e2e 脚本
 8. README / 安装说明
 
-## 14. 未决问题
+## 14. 已定的决定
 
-1. ~~L1（空闲窗口的强唤醒）v1 开不开？~~ → 已定：**开，且默认开启**。因此 §8.3 的 watcher 生命周期、§7 的三条运营约束（惊群去抖 / 批量投递 / 聋窗口检测）都是 v1 必须落实的部分，不是可选优化。
-2. ~~房间怎么分~~ → 已定：**房间就是主题树的顶层**，默认订阅由 `SessionStart` 按 cwd 种下（§6.1、§8.1），另有 `general` 供跨项目话题。
-3. ~~工作队列进不进 v1~~ → 已定：**进**，且已经融进 schema——任务不是独立实体，就是一条 `kind='request'` 的帖子 + 一条 `resource='task:<seq>'` 的认领（§5）。
-4. **还要不要保留 markdown 可读副本**？有了 `sqlite3` CLI，我倾向不留。待确认。
-5. **watcher 的最长挂载时间**取 12 小时还是 24 小时（上限 86400s）？影响重新武装的频率。
-6. 插件名最终定 `agent-bus` 还是 `kimi-agent-bus`？影响 `mcp__*` 命名长度（若将来补 MCP 接口）。
+设计已冻结。以下是全部决策记录，实施计划以此为依据：
+
+| # | 问题 | 决定 |
+|---|---|---|
+| 1 | L1（空闲窗口强唤醒）开不开 | **开，且默认开启**。因此 §7 的三条运营约束、§8.3 的 watcher 生命周期都是 v1 必做项，不是可选优化 |
+| 2 | 房间怎么分 | **房间就是主题树的顶层**；默认订阅由 `SessionStart` 按 cwd 种下（§6.1、§8.1），另有 `general` 供跨项目话题 |
+| 3 | 工作队列进不进 v1 | **进**，且已融进 schema——任务不是独立实体，就是一条 `kind='request'` 的帖子 + 一条 `resource='task:<seq>'` 的认领（§5） |
+| 4 | 保留 markdown 可读副本吗 | **不留**。数据库是唯一真源；可读性由 `sqlite3` CLI 与 `bus read` 提供 |
+| 5 | watcher 最长挂载时间 | **12 小时**（`--timeout 43200`）。引擎上限是 86400s，留一半余量；实际重武装通常由 `UserPromptSubmit` 自愈先触发 |
+| 6 | 插件名 | **`agent-bus`**（不是 `kimi-agent-bus`） |
+
+**命名落点**（由 #6 决定，实施时照此）：
+
+| 项 | 值 |
+|---|---|
+| 插件 id / manifest `name` | `agent-bus` |
+| 托管目录 | `~/.kimi-code/plugins/managed/agent-bus/` |
+| 数据目录 | `~/.kimi-code/agent-bus/`（`bus.db`、`claims.marker`） |
+| 斜杠命令 | `/agent-bus:peers`、`/agent-bus:watch`、`/agent-bus:digest` |
+| 将来若补 MCP 接口 | 工具名形如 `mcp__plugin-agent-bus_bus__*` |
+
+仓库名是 `km-agent-com`，与插件 id 无关——manifest 里的 `name` 才是插件身份。
+
+**接口已冻结**：§5 schema、§6.3 过滤谓词、§8 组件边界。下一步出实施计划。
 
 ## 15. 设计谱系：这套东西在 IPC 里的位置
 
