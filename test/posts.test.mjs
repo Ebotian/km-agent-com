@@ -188,7 +188,10 @@ test('poll：弱投递被上限截掉时不推进游标，下一轮继续投', (
     const r = posts.poll(db, { reader: 'me' });
     assert.equal(r.weak.length, posts.WEAK_MAX);
     assert.equal(r.weakHidden, 2);
-    assert.equal(r.nextCursor, posts.WEAK_MAX + 2, '整批的末尾仍是 nextCursor');
+    // nextCursor 的语义是"**已投递**行里的最大 seq"，不再是"整批的末尾"：被上限截掉的
+    // #11/#12 这一轮并没有投出去，把游标当成整批末尾来推就是那个静默丢失（推进游标请一律
+    // 用 ackUpTo）。改动见 backlog-fix-report.md。
+    assert.equal(r.nextCursor, posts.WEAK_MAX, 'nextCursor 是已投递行的最大 seq');
     assert.equal(r.ackUpTo, posts.WEAK_MAX, '游标只该推到确实投出去的最后一条');
     posts.ack(db, { reader: 'me', seq: r.ackUpTo });
     const r2 = posts.poll(db, { reader: 'me' });
@@ -220,5 +223,81 @@ test('poll：点名帖永远不被上限截掉（它必须在同一轮里被投�
     assert.deepEqual(r.strong.map(p => p.title), ['direct']);
     assert.equal(r.weakHidden, 3);
     assert.equal(r.ackUpTo, posts.WEAK_MAX, '被截掉的是弱帖；游标不越过它们');
+  });
+});
+
+// —— I6：弱帖洪水把点名帖挤出投递批次（控制方实测：前面堆 50/200/500 条弱帖时，那条 `@`
+// 根本没被取出来，watcher 空等到 --max-wait）——
+
+/**
+ * I6：以前 strong 与 weak 共享同一个 `LIMIT 50` 批次窗口，于是"游标之后的前 50 条全是弱帖"
+ * 时点名帖**根本没被取出来**，`strong` 是空数组——而 watcher 的退出判据正是
+ * `strong.length > 0`。这条 `@` 还不会自愈：watcher 不推进游标，空闲窗口也没有别的东西推
+ * 它，每轮 digest 只投 `WEAK_MAX` 条弱帖，200 条弱帖要 17 轮对话才排得到。
+ *
+ * 三种规模都必须把点名帖投出去，且弱帖那一路的上限、积压计数、游标不变量一条不动。
+ */
+test('I6：前面堆 50/200/500 条弱帖，点名帖仍必须被投出去', () => {
+  for (const n of [50, 200, 500]) {
+    withDb(db => {
+      posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+      for (let i = 1; i <= n; i++) seed(db, { title: `w${i}` });
+      const direct = seed(db, { title: 'direct', toSession: 'me' });
+      assert.equal(direct.seq, n + 1, '夹具：点名帖排在弱帖洪水之后');
+      const r = posts.poll(db, { reader: 'me' });
+      assert.deepEqual(r.strong.map(p => p.seq), [direct.seq],
+        `前面 ${n} 条弱帖时，点名帖 #${direct.seq} 也必须被取出来（它是 watcher 唯一看得懂的信号）`);
+      assert.equal(r.weak.length, posts.WEAK_MAX, `n=${n}：弱帖上限照旧`);
+      assert.equal(r.weakHidden, n - posts.WEAK_MAX, `n=${n}：积压计数必须是精确值`);
+      assert.equal(r.ackUpTo, posts.WEAK_MAX, `n=${n}：游标不越过被截掉的弱帖`);
+      assert.ok(r.total > 0);
+    });
+  }
+});
+
+test('poll：strong 溢出时不推进游标，下一轮继续投', () => {
+  withDb(db => {
+    for (let i = 1; i <= posts.STRONG_MAX + 5; i++) seed(db, { title: `d${i}`, toSession: 'me' });
+    const r = posts.poll(db, { reader: 'me' });
+    assert.equal(r.strong.length, posts.STRONG_MAX);
+    assert.equal(r.strongHidden, 5);
+    assert.equal(r.weakHidden, 0);
+    assert.equal(r.ackUpTo, posts.STRONG_MAX, '第 STRONG_MAX+1 条 strong 还没投出去，游标不许推过它');
+    posts.ack(db, { reader: 'me', seq: r.ackUpTo });
+    const r2 = posts.poll(db, { reader: 'me' });
+    assert.equal(r2.strong[0].seq, posts.STRONG_MAX + 1, '被截掉的 strong 必须能在下一轮投出去');
+    assert.equal(r2.strong.length, 5);
+  });
+});
+
+test('poll：两轴同时溢出时，游标只推到更早的那条未投递行之前', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    for (let i = 1; i <= posts.WEAK_MAX + 5; i++) seed(db, { title: `w${i}` });
+    for (let i = 1; i <= posts.STRONG_MAX + 5; i++) seed(db, { title: `d${i}`, toSession: 'me' });
+    const r = posts.poll(db, { reader: 'me' });
+    assert.equal(r.weak.length, posts.WEAK_MAX);
+    assert.equal(r.strong.length, posts.STRONG_MAX);
+    assert.equal(r.weakHidden, 5);
+    assert.equal(r.strongHidden, 5);
+    // 两轴的"下一条未投递"分别是 #11（weak）与 #66（strong）：取更早的那个减一
+    assert.equal(r.ackUpTo, posts.WEAK_MAX);
+  });
+});
+
+/**
+ * 两轴不重不漏：spec §6.3 的谓词是「点名给我 **或** 命中我订阅的前缀」，所以点名给**别人**
+ * 的帖子命中我订阅时照样投给我（重构前也是这么投的）。若弱帖那条查询写成 `to_session IS
+ * NULL`，这些帖子会从两条查询的缝里掉出去——又一个"在库里、投递路径看不见"的静默丢失。
+ */
+test('poll：点名给别人的帖子仍按订阅投给我', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    seed(db, { title: 'to-other', toSession: 'other' });
+    seed(db, { title: 'to-me', toSession: 'me' });
+    seed(db, { title: 'broadcast' });
+    const r = posts.poll(db, { reader: 'me' });
+    assert.deepEqual(r.strong.map(p => p.title), ['to-me']);
+    assert.deepEqual(r.weak.map(p => p.title), ['to-other', 'broadcast']);
   });
 });

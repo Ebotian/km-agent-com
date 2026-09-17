@@ -72,6 +72,19 @@ test('digestBlock 对超上限被截掉的弱投递明说还剩多少', () => {
   assert.match(out, /另有 7 条未列出/);
 });
 
+/**
+ * 强投递也有单轮上限（`posts.STRONG_MAX`）。被它截掉的那几条本轮没进上下文，只压着不说，
+ * 接收方会以为"跑完这 50 条就没事了"——而那几条 `@` 背后是有人在等。
+ */
+test('digestBlock 对超上限被截掉的强投递（点名）明说还剩多少', () => {
+  const out = r.digestBlock({
+    strong: [p()], weak: [],
+    strongHidden: 3, total: 4, reader: 'me', pluginRoot: '/plug',
+  });
+  assert.match(out, /另有 3 条点名给你的未列出/);
+  assert.match(out, /#142/, 'shown 的那条照旧要列出来');
+});
+
 test('digestBlock 提示重新武装 watcher 时能带上原因', () => {
   const out = r.digestBlock({
     strong: [], weak: [], total: 0, reader: 'me', pluginRoot: '/plug',

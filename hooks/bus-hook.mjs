@@ -205,11 +205,11 @@ function userPromptSubmit(db, { sid, now, procRoot, home, pluginRoot }) {
   // R4：`deaf === null` 是"在听"这个哨兵，只能用三元兜底——`?? 'never'` 只在 null/undefined
   // 上兜底，会把健康窗口误报成"从未武装"。
   const block = render.digestBlock({
-    strong: r.strong, weak: r.weak, weakHidden: r.weakHidden, total: r.total,
+    strong: r.strong, weak: r.weak, strongHidden: r.strongHidden, weakHidden: r.weakHidden, total: r.total,
     reader: sid, pluginRoot, deaf: peer ? peer.deaf : 'never',
   });
   // 投了就推进游标：同一条消息不该在每次用户说话时重复注入。推到 `ackUpTo` 而不是
-  // `nextCursor`——弱投递超过单轮上限时被截掉的那几条还没投出去，推过它们等于永久丢失。
+  // `nextCursor`——某一轴超过单轮上限时被截掉的那几条还没投出去，推过它们等于永久丢失。
   if (r.total > 0) posts.ack(db, { reader: sid, seq: r.ackUpTo });
   if (block) process.stdout.write(block + '\n');
   return 0;

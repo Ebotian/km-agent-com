@@ -97,6 +97,40 @@ test('strong 消息让 watcher 退出 0 并打印 seq', async () => {
   } finally { cleanup(home); }
 });
 
+/**
+ * I6 端到端：前面堆 200 条弱帖 + 1 条点名帖，watcher 必须**命中退出（0）**并在 stdout 里带出
+ * 那条点名帖的 seq，而不是空等到 `--max-wait` 退出 3。
+ *
+ * 这是控制方实测的场景：strong 与 weak 曾共享同一个 `LIMIT 50` 批次窗口，游标之后的前 50 条
+ * 全是弱帖时点名帖根本没被取出来——而 watcher 的退出判据正是 `strong.length > 0`。帖子在
+ * watcher 启动**之前**就落库，所以构造不靠时序运气（启动时那次 poll 必命中）。
+ */
+test('I6：200 条弱帖在前也照样唤醒，stdout 带那条点名帖的 seq', async () => {
+  const { home, procRoot } = seedHome();
+  const db = openDb(join(home, 'agent-bus', 'bus.db'));
+  for (let i = 1; i <= 200; i++) {
+    posts.createPost(db, { topic: 'agent-com', authorSession: 'other', authorCwd: '/p/other',
+      origin: 'agent', kind: 'finding', title: `weak${i}`, now: Date.now() });
+  }
+  const direct = posts.createPost(db, { topic: 'agent-com', authorSession: 'other', authorCwd: '/p/other',
+    origin: 'agent', kind: 'request', toSession: 'me', title: '点名给我', now: Date.now() });
+  assert.equal(direct.seq, 201, '夹具：点名帖排在 200 条弱帖之后');
+  db.close();
+
+  const w = startWatch(home, procRoot, ['--max-wait', '1500']);
+  try {
+    const started = Date.now();
+    const code = await waitExit(w.child, 8000);
+    assert.equal(code, 0,
+      `点名帖被弱帖洪水淹没（${Date.now() - started}ms 后以 ${code} 退出）：${w.stderr}${w.stdout}`);
+    assert.equal(w.stdout.includes('本轮无消息'), false, '命中不该是 --max-wait 的空等');
+    const payload = JSON.parse(w.stdout.trim().split('\n').pop());
+    assert.ok(payload.strong.some(p => p.seq === direct.seq),
+      `stdout 的 strong 必须含点名帖 #${direct.seq}`);
+    assert.match(w.stdout, new RegExp(`#${direct.seq} `), 'triage 行里也要有那条点名帖');
+  } finally { cleanup(home); }
+});
+
 test('一串 strong 合并成一次退出（批量投递）', async () => {
   const { home, procRoot } = seedHome();
   const w = startWatch(home, procRoot);

@@ -276,11 +276,11 @@ function cmdDigest(c) {
     .find(p => p.sessionId === me.sessionId);
   const pluginRoot = process.env.KIMI_PLUGIN_ROOT || '.';
   const block = render.digestBlock({
-    strong: r.strong, weak: r.weak, weakHidden: r.weakHidden, total: r.total,
+    strong: r.strong, weak: r.weak, strongHidden: r.strongHidden, weakHidden: r.weakHidden, total: r.total,
     reader: me.sessionId, pluginRoot, deaf: peer?.deaf ?? null,
   });
-  // 推到 `ackUpTo` 而不是 `nextCursor`：弱投递被单轮上限截掉的那几条还没投出去，
-  // 推过它们就是"计数报了、内容永远不到"那个缺陷的另一种写法。
+  // 推到 `ackUpTo` 而不是 `nextCursor`：某一轴被单轮上限截掉的那几条还没投出去，推过它们
+  // 就是"计数报了、内容永远不到"那个缺陷的另一种写法。
   if (!c.flags.peek && r.total > 0) posts.ack(c.db, { reader: me.sessionId, seq: r.ackUpTo });
   out(c, block ? block + '\n' : '', { ...r, block });
 }
@@ -523,7 +523,7 @@ function emitWatchResult(c, me, r) {
     return;
   }
   const block = render.digestBlock({
-    strong: r.strong, weak: r.weak, weakHidden: r.weakHidden, total: r.total,
+    strong: r.strong, weak: r.weak, strongHidden: r.strongHidden, weakHidden: r.weakHidden, total: r.total,
     reader: me.sessionId, pluginRoot: process.env.KIMI_PLUGIN_ROOT || '.',
   });
   process.stdout.write((block ? block + '\n' : '') + JSON.stringify(payload) + '\n');
