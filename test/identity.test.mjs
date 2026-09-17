@@ -149,6 +149,43 @@ test('upsertPresence 按 tui_pid 覆盖而非插入新行', () => {
   } finally { cleanup(home); }
 });
 
+/**
+ * `presence` 以 `tui_pid` 为主键，而 `/new` 会在同一 pid 上换掉 `session_id`——所以
+ * "按 pid 删"和"删我自己的行"是两件事。这条把两者分开钉住：
+ *
+ * - `removePresence` **必须**带 `sessionId`（缺了直接抛）：留着"只按 pid 删"的能力，就一定
+ *   会再被误用一次（这一轮的 bug 就是这么来的）；删不到自己的那一行时返回 0，什么都不动。
+ * - `reapPresence` 才是"这个 pid 已经不是活窗口"那条路径（被 SIGKILL 的窗口不会有
+ *   `SessionEnd`，那一行再没有主人，只能按 pid 判），`reapDead` 用的就是它。
+ */
+test('removePresence 只删自己会话那一行；按 pid 单删的能力收进 reapPresence', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.registerPresence(db, { tuiPid: 1, sessionId: 's_old', sessionTitle: '', cwd: '/p/a' });
+    id.registerPresence(db, { tuiPid: 2, sessionId: 's_other', sessionTitle: '', cwd: '/p/b' });
+    // /new 之后：同一 pid 上已经是新会话
+    id.registerPresence(db, { tuiPid: 1, sessionId: 's_new', sessionTitle: '', cwd: '/p/a' });
+
+    assert.equal(id.removePresence(db, { tuiPid: 1, sessionId: 's_old' }), 0,
+      '旧会话的 end 删不到新会话那一行（0 行受影响）');
+    assert.deepEqual(
+      id.listPresence(db, { now: 0, procRoot: '/nonexistent' }).map(r => r.sessionId).sort(),
+      ['s_new', 's_other'], '两行都该还在');
+
+    assert.equal(id.removePresence(db, { tuiPid: 1, sessionId: 's_new' }), 1, '自己的行照常删得掉');
+    assert.throws(() => id.removePresence(db, { tuiPid: 2 }), /需要 sessionId/,
+      '按 pid 单删的入口不许留在 removePresence 上');
+    assert.throws(() => id.removePresence(db, { tuiPid: 2, sessionId: '' }), /需要 sessionId/);
+    assert.deepEqual(id.listPresence(db, { now: 0, procRoot: '/nonexistent' }).map(r => r.sessionId), ['s_other'],
+      '抛出的两次都不该改动任何一行');
+
+    // reapDead 那条路径只按 pid 判：pid 不在假 /proc 里 ⇒ 那一行必须被回收（与它的 session 是谁无关）
+    assert.equal(id.reapDead(db, { procRoot: '/nonexistent' }), 1);
+    assert.deepEqual(id.listPresence(db, { now: 0, procRoot: '/nonexistent' }), []);
+  } finally { cleanup(home); }
+});
+
 test('reapDead 删掉 /proc 里不存在的窗口', () => {
   const home = makeTmpHome();
   const root = fakeProc([{ pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' }]);

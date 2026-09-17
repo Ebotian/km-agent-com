@@ -157,13 +157,43 @@ function sessionStart(db, { payload, sid, tuiPid, cwd, home, procRoot }) {
   return 0;
 }
 
+/**
+ * `SessionEnd` 的删除必须**限定到自己的会话**（R-E5）。
+ *
+ * 以前是 `removePresence(db, { tuiPid })`——只按 pid 删，不检查那一行是否还属于正在结束的
+ * 会话。而 `/new` 的顺序是「先 start 新会话（同一 `tui_pid` 上 `upsertPresence` 覆盖）、
+ * **后** end 旧会话」，于是旧会话的 end 把新会话刚写好的行（连同它刚武装的 watcher 登记）
+ * 一起抹掉：凡走过 `/new` 的窗口都登记不上，`peers`/`whoami`/`claim`/`post` 全部报
+ * "本窗口未在 presence 中登记"。判据只能是"那一行还是我的吗"。
+ *
+ * 载荷里 `session_id` 缺失或为空时**跳过删除**：此时无法判断那一行是不是自己的，而删错的
+ * 一行**没人能补回来**（新会话不会因为别人删了它就重跑 SessionStart）。宁可留一行陈旧登记
+ * ——它会被 `reapDead` 或下一个 `SessionStart` 的覆盖收敛——也不要动别人的行；但要留一行
+ * 审计说明"这次什么都没删、留在库里的是哪一行"，否则这类跳过在现场是无痕的。
+ *
+ * 故意**不删** `subs` / `read_cursor`：会话可能被 resume，删了会丢掉已读位置、导致重读老
+ * 消息；陈旧的 `subs` 行无害（按 `session_id` 键，没人会去读它）。
+ */
 function sessionEnd(db, { sid, tuiPid, home, now }) {
-  if (tuiPid != null) identity.removePresence(db, { tuiPid });
+  let action = 'session-end';
+  let detail = String(tuiPid);
+  if (tuiPid == null) {
+    // 认不出窗口（祖先遍历落空）就无从判断哪一行是自己的；既有的 `detail: "null"` 保留
+  } else if (!sid) {
+    const kept = db.prepare('SELECT session_id AS sid FROM presence WHERE tui_pid = ?').get(tuiPid);
+    action = 'session-end-missing-session';
+    detail = `${tuiPid} 未删（该 pid 上的行属于 ${kept?.sid ?? '（无）'}）`;
+  } else {
+    // 0 行 = 那一行已经不是我的（迟到的 end、别人的会话），什么都不该动
+    identity.removePresence(db, { tuiPid, sessionId: sid });
+  }
   // R-E4：只回收**未完结**的租约。直接 `DELETE ... WHERE holder_session = ?` 会把
   // completed_at 非空的行一并删掉，于是已做完的一次性任务复活、变回可认领。
+  // 租约按 session_id 键，与 pid 无关，因此缺 sid 时这条调用天然是空操作（没有 session
+  // 叫空串），不会误删别人的租约。
   claims.releaseAllForSession(db, { holderSession: sid });
   claims.syncMarker(db, { kimiHome: home, now });
-  appendLog(home, { actor: sid || '?', action: 'session-end', detail: String(tuiPid) });
+  appendLog(home, { actor: sid || '?', action, detail });
   return 0;
 }
 

@@ -246,6 +246,7 @@ async function main() {
   console.log('✓ 任务完结后从开放列表消失，且 completed_at 落库（不复活）');
 
   await concurrentRegistration();
+  sessionSwitch();
   precheckGate();
 
   console.log('\nE2E OK');
@@ -284,6 +285,45 @@ async function concurrentRegistration() {
     assert(new Set(hs).size === 6, `第 ${round} 轮 6 个窗口的 handle 必须互不相同，实际 ${hs.join('、')}`);
   }
   console.log(`✓ ${ROUNDS} 轮 × 6 进程并发注册同一 cwd：每轮 6 行、handle 互不相同`);
+}
+
+/**
+ * R-E5：`/new` 的动作顺序是「先 start 新会话、**后** end 旧会话」——`SessionEnd` 只按 pid 删
+ * 的话，删掉的正是新会话刚写好的那一行，于是**凡走过 `/new` 的窗口都登记不上**（换会话、
+ * 清上下文都会走它，是最日常的路径）。生产现场就是这么坏的：`log.jsonl` 里
+ * `start(new)` → `end(old)` 交错，而 `presence` 0 行、`subs` 2 行。
+ *
+ * 这里用真 hook + 真 CLI 跑一遍那个交错，并顺手钉住"载荷缺 `session_id` 的 end 只留审计、
+ * 不删行"。断言全部读库核对（CLI 的输出是被测对象，不拿它验它自己），只在最后用一次
+ * `whoami` 看用户可见形态。
+ */
+function sessionSwitch() {
+  const h = newHome('new');
+  const pid = 90021;
+  const OLD_S = 'session_swold-0001';
+  const NEW_S = 'session_swnew-0002';
+  seedWindowProc(h, pid);
+  hook('SessionStart', { session_id: OLD_S, cwd: '/p/agent-com', session_title: '旧' }, { ...h, tuiPid: pid });
+  assert(query(h, 'SELECT session_id FROM presence').length === 1, '前置：旧会话已登记');
+
+  // /new 的真实顺序：先 start 新会话（同一 pid 上覆盖），后 end 旧会话
+  hook('SessionStart', { session_id: NEW_S, cwd: '/p/agent-com', session_title: '新' }, { ...h, tuiPid: pid });
+  hook('SessionEnd', { session_id: OLD_S, cwd: '/p/agent-com' }, { ...h, tuiPid: pid });
+
+  const rows = query(h, 'SELECT tui_pid, session_id, handle FROM presence');
+  assert(rows.length === 1 && rows[0].session_id === NEW_S,
+    `走过 /new 的窗口必须仍登记着新会话，实际 ${JSON.stringify(rows)}`);
+  const me = JSON.parse(cli(['whoami', '--json', '--tui-pid', String(pid)], h).stdout);
+  assert(me.sessionId === NEW_S, `whoami 应认出新会话，实际 ${me.sessionId}`);
+
+  // 载荷缺 session_id 的 end：跳过删除（宁可留陈旧行，也不删别人的行），并留一行审计
+  hook('SessionEnd', { cwd: '/p/agent-com' }, { ...h, tuiPid: pid });
+  const kept = query(h, 'SELECT session_id FROM presence');
+  assert(kept.length === 1 && kept[0].session_id === NEW_S, '缺 session_id 的 end 不许删任何行');
+  const logged = JSON.parse(cli(['log', '--json', '--limit', '10', '--home', h.home], h).stdout);
+  assert(logged.some(e => e.action === 'session-end-missing-session'), '跳过删除必须留痕（否则现场无痕）');
+
+  console.log('✓ /new 交错（start(new) → end(old)）后窗口仍登记着新会话；缺 session_id 的 end 只留审计不删行');
 }
 
 /** 一个只记录自己被调用的 `node` 桩：用来直接观察预检有没有进入 `exec node` 分支。 */
