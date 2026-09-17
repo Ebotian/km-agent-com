@@ -397,7 +397,7 @@ alive(pid) := process.kill(pid, 0) 成功   且   /proc/<pid>/cmdline 是 kimi-c
 
 实测（2026-09-17）：扫描 `/proc` 下 375 个 pid，靠 `cmdline` 命中 kimi-code 窗口 1 个，并顺带读到它的 cwd。加 `cmdline` 校验是为了防 pid 复用——单靠 `process.kill(pid,0)`，一个被回收后又分配给别的进程的 pid 会被误判成活着的窗口。
 
-**实现陷阱**：node 会重写 `process.title`，所以 `/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着**一长串空格填充**。别用精确相等判断，用 `/^kimi-code\s*$/`。
+**实现陷阱**：node 会重写 `process.title`，所以 `/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着**一长串 NUL 填充**（`/proc/<pid>/cmdline` 的格式本来就是"每个 argv 元素一个 NUL 终止符"，而 `process.title` 重写会复用原 argv 区、把标题之后的剩余字节清零）。实测（2026-09-17，本机活窗口）：该文件是 `kimi-code` + **168 个 `\0`**，共 169 字节；`cmdline` 里 `kimi-code` 后面跟着的也可能是字面空格，所以**别用精确相等判断，用 `/^kimi-code\s*$/`**——NUL 与空格两种填充形态都要容忍（读出来的字符串会先剥掉首尾空白/NUL）。
 
 于是**删掉 `SessionHeartbeat` hook 与 `presence.heartbeat_at`**：少一个 hook、少一列、少掉每窗口每分钟一次的进程拉起。清理由任何一次 `bus` 命令或 watcher 的 tick 顺带完成——这本来也必须做，因为被 SIGKILL 的窗口不会有 `SessionEnd`。
 

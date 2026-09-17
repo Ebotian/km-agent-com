@@ -1084,7 +1084,7 @@ git commit -m "feat: posts.mjs 发帖/增量读/游标/订阅；修正 spec 谓�
   - `handleFromCwd(db, cwd): string` —— basename 规范化，与已有 handle 冲突时追加 `-2`、`-3`
   - `reapDead(db, {procRoot?}): number`
 
-> **实现陷阱（spec §8.1 已记录）**：node 会重写 `process.title`，`/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着一长串空格填充。**必须用 `/^kimi-code\s*$/` 判断，不能用精确相等。** 假 proc 树里的测试数据要按同样格式写，否则测不出这个坑。
+> **实现陷阱（spec §8.1 已记录）**：node 会重写 `process.title`，`/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着一长串 **NUL** 填充（实测本机活窗口：`kimi-code` + 168 个 `\0`；也可能是字面空格）。**必须用 `/^kimi-code\s*$/` 判断，不能用精确相等。** 假 proc 树里的测试数据要按同样格式写，否则测不出这个坑。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1106,7 +1106,7 @@ function fakeProc(entries) {
     const d = join(root, String(pid));
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, 'stat'), `${pid} (${comm}) S ${ppid} 1 1 0 -1 0 0 0\n`);
-    writeFileSync(join(d, 'cmdline'), cmdline.split('').join('\0') + '\0');
+    writeFileSync(join(d, 'cmdline'), cmdline + '\0');
   }
   return root;
 }
@@ -1212,7 +1212,51 @@ test('reapDead 删掉 /proc 里不存在的窗口', () => {
     assert.deepEqual(id.listPresence(db, { now: 0, procRoot: root }).map(r => r.sessionId), ['live']);
   } finally { cleanup(home); cleanup(root); }
 });
+
+test('alive 走 cmdline 校验：pid 被复用不算活窗口', () => {
+  const home = makeTmpHome();
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 600, comm: 'node', ppid: 1, cmdline: 'node /tmp/other.js' },   // 复用了他人的 pid
+  ]);
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.upsertPresence(db, { tuiPid: 100, sessionId: 'real', sessionTitle: '', cwd: '/p', handle: 'a' });
+    id.upsertPresence(db, { tuiPid: 600, sessionId: 'reused', sessionTitle: '', cwd: '/p', handle: 'b' });
+
+    const bySid = Object.fromEntries(
+      id.listPresence(db, { now: 1000, procRoot: root }).map(r => [r.sessionId, r]));
+    assert.equal(bySid.real.alive, true, 'cmdline 是 kimi-code ⇒ 真窗口');
+    assert.equal(bySid.reused.alive, false, '目录存在但 cmdline 不是 kimi-code ⇒ pid 被复用，不算活窗口');
+
+    assert.equal(id.reapDead(db, { procRoot: root }), 1, '只回收被复用的那行');
+    assert.deepEqual(id.listPresence(db, { now: 1000, procRoot: root }).map(r => r.sessionId), ['real']);
+  } finally { cleanup(home); cleanup(root); }
+});
+
+test('watcher pid 被复用（cmdline 不是 bus.mjs watch）判为 dead', () => {
+  const home = makeTmpHome();
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 601, comm: 'node', ppid: 1, cmdline: 'node /tmp/other.js' },                     // 复用
+    { pid: 602, comm: 'node', ppid: 1, cmdline: 'node /x/bin/bus.mjs watch --session s' },  // 真 watcher
+  ]);
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.upsertPresence(db, { tuiPid: 100, sessionId: 's1', sessionTitle: '', cwd: '/p/a', handle: 'a' });
+
+    id.setWatcher(db, { tuiPid: 100, watcherPid: 601, watcherUntil: 999999 });
+    assert.equal(id.listPresence(db, { now: 1000, procRoot: root })[0].deaf, 'dead',
+      '租约没过期，但 watcher 的 cmdline 不是 bus.mjs watch ⇒ 复用');
+
+    id.setWatcher(db, { tuiPid: 100, watcherPid: 602, watcherUntil: 999999 });
+    assert.equal(id.listPresence(db, { now: 1000, procRoot: root })[0].deaf, null,
+      'cmdline 含 bus.mjs watch 的真 watcher 不算聋');
+  } finally { cleanup(home); cleanup(root); }
+});
 ```
+
+> **为什么 `fakeProc` 写的是 `cmdline + '\0'`**：`/proc/<pid>/cmdline` 的格式是**每个 argv 元素以 NUL 终止**，NUL 只出现在元素之间、末尾一个终止符，**不是逐字符插 NUL**。逐字符插（`cmdline.split('').join('\0') + '\0'`）会产出 `k\0i\0m\0i\0-…`，被 `readCmdline` 的 `.replace(/\0/g, ' ')` 还原成 `k i m i - c o d e`，于是 `/^kimi-code\s*$/` 永不匹配、`cmdlineRole` 恒返回 `null`——假 proc 树里所有依赖 cmdline 的判定都会失效。测试数据里的 `'kimi-code      '` 本身保留（它模拟 `process.title` 重写后可能出现的空格填充），只在尾巴上补一个正常的 argv 终止符。
 
 - [ ] **Step 2: 运行测试，确认失败**
 
@@ -1261,6 +1305,10 @@ export function cmdlineRole(cmdline) {
 
 export function pidEntryExists(pid, procRoot = DEFAULT_PROC_ROOT) {
   return existsSync(join(procRoot, String(pid)));
+}
+
+function pidHasRole(pid, role, procRoot) {
+  return pidEntryExists(pid, procRoot) && cmdlineRole(readCmdline(pid, procRoot)) === role;
 }
 
 export function findKimiAncestor(startPid, procRoot = DEFAULT_PROC_ROOT, maxDepth = 16) {
@@ -1315,7 +1363,7 @@ function deafState(row, { now, procRoot }) {
     if (row.watcherUntil != null && row.watcherUntil <= now) return 'expired';
     return 'never';
   }
-  if (!pidEntryExists(row.watcherPid, procRoot)) return 'dead';
+  if (!pidHasRole(row.watcherPid, 'bus-watch', procRoot)) return 'dead';
   if (row.watcherUntil != null && row.watcherUntil <= now) return 'expired';
   return null;
 }
@@ -1327,7 +1375,7 @@ export function listPresence(db, { now, procRoot = DEFAULT_PROC_ROOT }) {
       FROM presence ORDER BY tui_pid
   `).all().map(row => ({
     ...row,
-    alive: pidEntryExists(row.tuiPid, procRoot),
+    alive: pidHasRole(row.tuiPid, 'kimi-code', procRoot),
     deaf: deafState(row, { now, procRoot }),
   }));
 }
@@ -1347,7 +1395,7 @@ export function reapDead(db, { procRoot = DEFAULT_PROC_ROOT } = {}) {
   const rows = db.prepare('SELECT tui_pid FROM presence').all();
   let n = 0;
   for (const r of rows) {
-    if (!pidEntryExists(r.tui_pid, procRoot)) {
+    if (!pidHasRole(r.tui_pid, 'kimi-code', procRoot)) {
       removePresence(db, { tuiPid: r.tui_pid });
       n++;
     }
@@ -1359,7 +1407,7 @@ export function reapDead(db, { procRoot = DEFAULT_PROC_ROOT } = {}) {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `node --test test/identity.test.mjs`
-Expected: PASS，8 个用例全绿
+Expected: PASS，10 个用例全绿
 
 - [ ] **Step 5: 提交**
 
@@ -1367,6 +1415,8 @@ Expected: PASS，8 个用例全绿
 git add lib/identity.mjs test/identity.test.mjs
 git commit -m "feat: identity.mjs 祖先遍历/存活判定/presence 与 watcher 登记"
 ```
+
+> **上面两个代码块是交付态（含后续 `fix:` 提交的 R-G1 修正）**：存活判定不只看 `/proc/<pid>` 目录是否存在，而是 `pidEntryExists(pid) && cmdlineRole(readCmdline(pid)) === <role>`（`pidHasRole`）——`listPresence.alive` 与 `reapDead` 用 `'kimi-code'`，`deafState` 判"watcher 已死"用 `'bus-watch'`。这是 spec §8.1 的 `alive := 进程存在 且 cmdline 是 kimi-code` 与 §8.3 的"判死活仍用同一套检查，只是校验 `bus.mjs watch`"的落地；不这样做，一个被回收后分配给别的进程的 pid 会被误判成活窗口，而 `cmdlineRole` 的 `'bus-watch'` 分支会变成死代码。僵尸进程的 `/proc` 目录仍在但 `cmdline` 为空 ⇒ `cmdlineRole` 返回 `null` ⇒ 判为不活。
 
 ---
 

@@ -119,3 +119,45 @@ test('reapDead 删掉 /proc 里不存在的窗口', () => {
     assert.deepEqual(id.listPresence(db, { now: 0, procRoot: root }).map(r => r.sessionId), ['live']);
   } finally { cleanup(home); cleanup(root); }
 });
+
+test('alive 走 cmdline 校验：pid 被复用不算活窗口', () => {
+  const home = makeTmpHome();
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 600, comm: 'node', ppid: 1, cmdline: 'node /tmp/other.js' },   // 复用了他人的 pid
+  ]);
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.upsertPresence(db, { tuiPid: 100, sessionId: 'real', sessionTitle: '', cwd: '/p', handle: 'a' });
+    id.upsertPresence(db, { tuiPid: 600, sessionId: 'reused', sessionTitle: '', cwd: '/p', handle: 'b' });
+
+    const bySid = Object.fromEntries(
+      id.listPresence(db, { now: 1000, procRoot: root }).map(r => [r.sessionId, r]));
+    assert.equal(bySid.real.alive, true, 'cmdline 是 kimi-code ⇒ 真窗口');
+    assert.equal(bySid.reused.alive, false, '目录存在但 cmdline 不是 kimi-code ⇒ pid 被复用，不算活窗口');
+
+    assert.equal(id.reapDead(db, { procRoot: root }), 1, '只回收被复用的那行');
+    assert.deepEqual(id.listPresence(db, { now: 1000, procRoot: root }).map(r => r.sessionId), ['real']);
+  } finally { cleanup(home); cleanup(root); }
+});
+
+test('watcher pid 被复用（cmdline 不是 bus.mjs watch）判为 dead', () => {
+  const home = makeTmpHome();
+  const root = fakeProc([
+    { pid: 100, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 601, comm: 'node', ppid: 1, cmdline: 'node /tmp/other.js' },                     // 复用
+    { pid: 602, comm: 'node', ppid: 1, cmdline: 'node /x/bin/bus.mjs watch --session s' },  // 真 watcher
+  ]);
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.upsertPresence(db, { tuiPid: 100, sessionId: 's1', sessionTitle: '', cwd: '/p/a', handle: 'a' });
+
+    id.setWatcher(db, { tuiPid: 100, watcherPid: 601, watcherUntil: 999999 });
+    assert.equal(id.listPresence(db, { now: 1000, procRoot: root })[0].deaf, 'dead',
+      '租约没过期，但 watcher 的 cmdline 不是 bus.mjs watch ⇒ 复用');
+
+    id.setWatcher(db, { tuiPid: 100, watcherPid: 602, watcherUntil: 999999 });
+    assert.equal(id.listPresence(db, { now: 1000, procRoot: root })[0].deaf, null,
+      'cmdline 含 bus.mjs watch 的真 watcher 不算聋');
+  } finally { cleanup(home); cleanup(root); }
+});
