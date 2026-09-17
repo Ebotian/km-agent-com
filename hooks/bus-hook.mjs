@@ -5,7 +5,7 @@
 // 拒绝这次调用（"做不成"），比任何"通知"（"被告知别做"）都强。其余三个都是尽力而为的
 // 副作用与投递，所以整个流程 fail-open——总线一挂绝不能卡死所有窗口的工具调用。
 import { join } from 'node:path';
-import { openDb, appendLog } from '../lib/db.mjs';
+import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
 import { topicFromCwd } from '../lib/topic.mjs';
 import * as identity from '../lib/identity.mjs';
 import * as posts from '../lib/posts.mjs';
@@ -108,13 +108,11 @@ function sessionEnd(db, { sid, tuiPid, home, now }) {
   return 0;
 }
 
-/** `Date` 能表示的最大毫秒数；超过它的 `toISOString()` 会抛 `RangeError: Invalid time value`。 */
-const DATE_MAX_MS = 8.64e15;
-
 /**
- * 租约期限的渲染**绝不能抛**（R-T1）。`lease_until` 落在 `(8.64e15, 9.007e15]` 时它仍是
+ * 租约期限的渲染**绝不能抛**（R-T1）。`lease_until` 落在 `(DATE_MAX_MS, 9.007e15]` 时它仍是
  * JS **安全整数**：SQL 侧比较照常（`conflicts` 会正常判出冲突），但 `new Date(lu)`
  * `.toISOString()` 会抛。文案能不能拼出来，绝不能改变"拦不拦"这个判定。
+ * 上界取自 `lib/db.mjs`（与 CLI 的 `--now` 守卫同一个常量）。
  */
 function leaseLabel(leaseUntil) {
   return Number.isSafeInteger(leaseUntil) && Math.abs(leaseUntil) <= DATE_MAX_MS

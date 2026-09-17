@@ -2,7 +2,7 @@
 import { join } from 'node:path';
 import { readFileSync, watch } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
-import { openDb, appendLog } from '../lib/db.mjs';
+import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
 import { ALL_TOPIC, normalizeTopic } from '../lib/topic.mjs';
 import * as identity from '../lib/identity.mjs';
 import * as claims from '../lib/claims.mjs';
@@ -40,6 +40,7 @@ const USAGE = `用法: node bin/bus.mjs <命令> [参数] [--json] [--home <dir>
   release <resource>           释放自己的租约
   done <postSeq> [--result S]  完结 task:<seq>，--result 附带一条 finding
   tasks                        列出未认领且未完成的 request
+  prune [--keep N]             归档：每个主题只保留最新 N 条（默认 5000），随后回收 WAL
   log [--limit N]              读审计日志（默认 20 条，最新在前）
   watch [--interval <ms>] [--timeout <sec>] [--max-wait <ms>]
                                自注册为 L1 watcher 并阻塞等待；只有点名给自己的
@@ -67,23 +68,36 @@ function parseArgs(argv) {
   return { flags, positional };
 }
 
+const TTL_MAX_MS = 365 * 24 * 60 * 60 * 1000;
+
 /**
- * `--now` 的统一守卫（R-T2）。它被当租约基准算进 `lease_until`，所以越界的 `--now` 会
- * 写出**超出 JS 安全整数**的 int64：SQLite 收得下，此后 `claims.conflicts` 一读就抛
+ * `--now` 的统一守卫（R-T2 + R-T4）。它被当租约基准算进 `lease_until`，所以越界的 `--now`
+ * 会写出**超出 JS 安全整数**的 int64：SQLite 收得下，此后 `claims.conflicts` 一读就抛
  * `ERR_OUT_OF_RANGE`，`PreToolUse` 对那条资源只能 fail-open ⇒ 唯一保证正确性的机制（L0）
- * 静默失效，而操作者看到的只是"claim 失败"（或什么都没看到）。上界取 8.64e15，与 `log`
- * 判坏时间戳的那条日期上界一致。
+ * 静默失效，而操作者看到的只是"claim 失败"（或什么都没看到）。上界取 `DATE_MAX_MS`
+ * （见 `lib/db.mjs`），与 `log` 判坏时间戳的那条日期上界是同一个常量。
+ *
+ * **R-T4：只挡住 `now` 本身还不够。** `lease_until = now + ttl`——`--now` 取到上界时加
+ * 任何租约都越界，写进库那一刻是"成功"，但此后 busy/claim 渲染该租约会抛 RangeError
+ * ⇒「被占用」被报成 exit 1。所以守卫按**最坏的租约**预留 `TTL_MAX_MS` 的余量：任何合法
+ * `--now` 配上任何合法 `--ttl` 都仍落在日期范围内。
  *
  * 必须落在 `ctx()` 里、**任何写库之前**：各个子命令自己查会漏，而漏掉的那条就是漏洞。
  */
-const DATE_MAX_MS = 8.64e15;
-
 function parseNow(raw) {
   if (raw == null) return Date.now();
   const n = Number(raw);
-  if (!Number.isSafeInteger(n) || Math.abs(n) > DATE_MAX_MS) {
-    throw new Error(`--now 需要安全整数且 |now| ≤ 8.64e15（与日志的日期上界一致），收到 ${raw}`);
+  if (!Number.isSafeInteger(n) || Math.abs(n) + TTL_MAX_MS > DATE_MAX_MS) {
+    throw new Error(
+      `--now 需要安全整数且 |now| + 最大租约（8760h）不超过 8.64e15，收到 ${raw}`);
   }
+  return n;
+}
+
+/** 复用给所有「正整数」flag 的校验（`--interval`/`--timeout`/`--max-wait`/`--keep`）。 */
+function positiveInt(raw, flag) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) throw new Error(`${flag} 需要正整数，收到 ${raw}`);
   return n;
 }
 
@@ -182,6 +196,21 @@ function cmdPost(c) {
   if (!title) throw new Error('post 需要 --title');
   const toSession = resolveTarget(c, c.flags.to);
   if (toSession === me.sessionId) throw new Error('不能发给自己');
+  // 限流（spec §9）：同一作者在同一主题上每分钟最多一条**点名帖**。一条 `@` 会当场唤醒
+  // 对面整个 agent，而一次唤醒 = 整个上下文重读（spec §3.3，实测 113k token）——没有这条，
+  // 一次刷屏就是一次昂贵的重读，而且是持久的（对面被唤醒后还得处理这堆消息）。
+  // 广播帖不在此列：它的成本由读取方的轮次边界吸收，不需要靠限流来护。
+  if (toSession) {
+    const n = posts.recentDirectCount(c.db, {
+      authorSession: me.sessionId, topic, since: c.now - 60_000,
+    });
+    if (n >= 1) {
+      process.stderr.write(
+        `触发限流：你在 ${topic} 上刚刚点过名。改用不带 --to 的广播帖，或等一分钟后重试。\n`);
+      process.exitCode = 2;
+      return;
+    }
+  }
   const origin = c.flags.origin ?? 'agent';
   const { seq } = posts.createPost(c.db, {
     topic, authorSession: me.sessionId, authorCwd: me.cwd, origin, kind,
@@ -238,8 +267,6 @@ function cmdSubs(c) {
   out(c, (subscriptions.join('\n') || '（无订阅）') + '\n', { subscriptions });
 }
 
-const TTL_MAX_MS = 365 * 24 * 60 * 60 * 1000;
-
 /**
  * 两个必须在**写库之前**拒掉的取值：
  * - `0`（或任何算出来是 0 的写法）：claim 会返回 `claimed:true`，但租约当场过期——
@@ -267,9 +294,18 @@ function parseTtl(s) {
  * 置成当时刻、completed_at 置上；busy()/claim() 对已完成行返回 null）。
  * 绝不能拿它去 new Date()——那是 epoch，会渲染成 1970-01-01，把「已做完」
  * 读成「很久以前就该过期了」。
+ *
+ * 渲染**绝不能抛**（R-T4）：`lease_until` 落在 `(8.64e15, 9.007e15]` 时它仍是 JS 安全整数
+ * （SQL 比较照常、`conflicts` 正常判出冲突），但 `toISOString()` 会抛 `RangeError`。那会把
+ * 「被占用」（exit 2）报成「用法错」（exit 1），持有者信息整条丢失——一次格式化失败就改写了
+ * 判定结果。入口的 `--now` 守卫（parseNow）收窄的是新写入的行，历史遗留行照样在库里，
+ * 所以这里必须自己兜底。
  */
 function leaseLabel(leaseUntil) {
-  return leaseUntil == null ? '已完成' : `租约至 ${new Date(leaseUntil).toISOString()}`;
+  if (leaseUntil == null) return '已完成';
+  return Number.isSafeInteger(leaseUntil) && Math.abs(leaseUntil) <= DATE_MAX_MS
+    ? `租约至 ${new Date(leaseUntil).toISOString()}`
+    : `原值 ${leaseUntil}（超出 Date 表示范围）`;
 }
 
 /** 冲突文案里给人看的是 handle（能直接拿去 --to），查不到才回落到 session_id。 */
@@ -376,7 +412,7 @@ function cmdLog(c) {
       const e = JSON.parse(line);
       // 坏行必须能整条跳过，而不是把命令带崩：`{"ts":1e999}` 会被 JSON.parse 成 Infinity，
       // 超出 Date 表示范围的大数同样是雷，两者都会让下面的 toISOString() 抛 RangeError。
-      if (e && Number.isFinite(e.ts) && Math.abs(e.ts) <= 8.64e15) entries.push(e);
+      if (e && Number.isFinite(e.ts) && Math.abs(e.ts) <= DATE_MAX_MS) entries.push(e);
     } catch { /* 半行/损坏行跳过 */ }
   }
   const latest = entries.slice(-limit).reverse();
@@ -384,6 +420,29 @@ function cmdLog(c) {
     `${new Date(e.ts).toISOString()}\t${render.sanitize(e.actor)}\t${render.sanitize(e.action)}\t${render.sanitize(e.detail, 200)}`
   ).join('\n') || '（无审计记录）';
   out(c, human + '\n', latest);
+}
+
+/**
+ * 归档（spec §9 的磁盘增长上限）。**全项目唯一一处删除 `posts` 的入口**，语义收在
+ * `posts.pruneTopic()` 里；这里只负责"对每个主题各做一次"+checkpoint。
+ *
+ * checkpoint 是这一步的一半：WAL 里的页在 TRUNCATE 后交还给文件系统，否则删掉的行
+ * 仍以 WAL 的形式占着磁盘，"上限"只是账面数字。失败不该让命令失败（归档结果已经生效），
+ * 但要说出来。
+ */
+function cmdPrune(c) {
+  resolveSelf(c);
+  const keep = positiveInt(c.flags.keep ?? 5000, '--keep');
+  const topics = posts.listTopics(c.db).map(t => t.topic);
+  let deleted = 0;
+  for (const topic of topics) deleted += posts.pruneTopic(c.db, { topic, keep });
+  try {
+    c.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  } catch (err) {
+    process.stderr.write(`警告: wal_checkpoint 失败（归档已生效，WAL 未回收）: ${err.message}\n`);
+  }
+  appendLog(c.home, { actor: 'cli', action: 'prune', detail: `keep=${keep} deleted=${deleted}` });
+  out(c, `已归档 ${deleted} 条（每个主题保留 ${keep} 条）\n`, { deleted, keep, topics: topics.length });
 }
 
 // —— watch：L1 强唤醒（空闲窗口的秒级唤醒）——
@@ -426,12 +485,6 @@ function makeWaker() {
       return new Promise((resolve) => { pending = { resolve, timer: setTimeout(wake, ms) }; });
     },
   };
-}
-
-function positiveInt(raw, flag) {
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n <= 0) throw new Error(`${flag} 需要正整数，收到 ${raw}`);
-  return n;
 }
 
 /**
@@ -538,6 +591,7 @@ const COMMANDS = {
   release: cmdRelease,
   done: cmdDone,
   tasks: cmdTasks,
+  prune: cmdPrune,
   log: cmdLog,
   watch: cmdWatch,
 };
