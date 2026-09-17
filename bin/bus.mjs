@@ -1,15 +1,21 @@
 #!/usr/bin/env node
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { openDb, appendLog } from '../lib/db.mjs';
-import { normalizeTopic } from '../lib/topic.mjs';
+import { ALL_TOPIC, normalizeTopic } from '../lib/topic.mjs';
 import * as identity from '../lib/identity.mjs';
+import * as claims from '../lib/claims.mjs';
 import * as posts from '../lib/posts.mjs';
 import * as render from '../lib/render.mjs';
 
 // 下游提前关闭（`| head -2`、分页读取）会让异步写抛 EPIPE。此时输出已无人接收，
-// 正常退出即可——这里用 process.exit 是安全的，没有缓冲需要排空。
+// 直接退出即可——没有还值得排空的缓冲。但退出码不能丢：命令可能已经置了非零码
+// （如 busy/claim 的 2），无条件 exit 0 会把失败报成成功。
 // 非 EPIPE 的写错误不能让进程以 0 退出（输出没送达），回落成失败码。
-const onStdoutError = (e) => { if (e.code === 'EPIPE') process.exit(0); else process.exitCode = 1; };
+const onStdoutError = (e) => {
+  if (e.code === 'EPIPE') process.exit(process.exitCode ?? 0);
+  else process.exitCode = 1;
+};
 process.stdout.on('error', onStdoutError);
 // stderr 是尽力而为：它挂了也不能把失败改成成功，保持既有退出码。
 process.stderr.on('error', () => {});
@@ -26,6 +32,12 @@ const USAGE = `用法: node bin/bus.mjs <命令> [参数] [--json] [--home <dir>
   digest [--peek]              投递未读（默认推进游标）
   search <文本>
   subscribe <pattern> | unsubscribe <pattern> | subs
+  claim <resource> [--ttl 30m] [--note S]   认领文件/端口/任务（默认 30m）；被占退出 2
+  busy <resource>              查占用；被占退出 2
+  release <resource>           释放自己的租约
+  done <postSeq> [--result S]  完结 task:<seq>，--result 附带一条 finding
+  tasks                        列出未认领且未完成的 request
+  log [--limit N]              读审计日志（默认 20 条，最新在前）
 `;
 
 function parseArgs(argv) {
@@ -49,6 +61,11 @@ function ctx(flags, positional) {
   const procRoot = flags['proc-root'] || process.env.AGENT_BUS_PROC_ROOT || identity.DEFAULT_PROC_ROOT;
   const now = flags.now ? Number(flags.now) : Date.now();
   const db = openDb(join(home, 'agent-bus', 'bus.db'));
+  // spec §10：presence 的清扫不另设定时器，由任何一次 bus 命令顺带完成。
+  // 清扫是搭车性质，失败只提示，绝不能让主命令失败。
+  try { identity.reapDead(db, { procRoot }); } catch (err) {
+    process.stderr.write(`警告: 清扫 presence 失败: ${err.message}\n`);
+  }
   return { home, procRoot, now, db, flags, positional };
 }
 
@@ -190,6 +207,137 @@ function cmdSubs(c) {
   out(c, (subscriptions.join('\n') || '（无订阅）') + '\n', { subscriptions });
 }
 
+function parseTtl(s) {
+  if (s == null) return 30 * 60_000;
+  const m = /^(\d+)(ms|s|m|h)?$/.exec(String(s).trim());
+  if (!m) throw new Error(`无法解析 --ttl: ${s}`);
+  const n = Number(m[1]);
+  const unit = m[2] ?? 'ms';
+  return n * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[unit];
+}
+
+/**
+ * `leaseUntil === null` 是唯一的带内「已完成」信号（Task 3：complete() 把 lease_until
+ * 置成当时刻、completed_at 置上；busy()/claim() 对已完成行返回 null）。
+ * 绝不能拿它去 new Date()——那是 epoch，会渲染成 1970-01-01，把「已做完」
+ * 读成「很久以前就该过期了」。
+ */
+function leaseLabel(leaseUntil) {
+  return leaseUntil == null ? '已完成' : `租约至 ${new Date(leaseUntil).toISOString()}`;
+}
+
+/** 冲突文案里给人看的是 handle（能直接拿去 --to），查不到才回落到 session_id。 */
+function holderLabel(c, holder) {
+  if (!holder) return '（未知）';
+  return c.db.prepare('SELECT handle FROM presence WHERE session_id = ?').get(holder)?.handle ?? holder;
+}
+
+function cmdClaim(c) {
+  const me = resolveSelf(c);
+  const resource = c.positional[0];
+  if (!resource) throw new Error('claim 需要 <resource>');
+  const r = claims.claim(c.db, {
+    resource, holderSession: me.sessionId, ttlMs: parseTtl(c.flags.ttl),
+    note: c.flags.note ?? null, now: c.now,
+  });
+  claims.syncMarker(c.db, { kimiHome: c.home, now: c.now });
+  appendLog(c.home, { actor: me.sessionId, action: r.claimed ? 'claim' : 'claim-failed', detail: resource });
+  if (!r.claimed) {
+    const line = `已被 ${holderLabel(c, r.holder)} 占用，${leaseLabel(r.leaseUntil)}\n`;
+    process.stderr.write(line);
+    out(c, line, r);
+    // 用 exitCode 而非 process.exit()：stdout 上还压着没排空的缓冲（见入口注释）。
+    process.exitCode = 2;
+    return;
+  }
+  out(c, `已认领 ${render.sanitize(resource, 300)}，${leaseLabel(r.leaseUntil)}\n`, r);
+}
+
+function cmdBusy(c) {
+  resolveSelf(c);
+  const resource = c.positional[0];
+  if (!resource) throw new Error('busy 需要 <resource>');
+  const r = claims.busy(c.db, { resource, now: c.now });
+  const holderHandle = r.holder ? holderLabel(c, r.holder) : null;
+  // handle 由 topicFromCwd 规范化而来（只含字母/数字/._-），进上下文是安全的。
+  out(c, r.held
+    ? `被 ${holderHandle} 占用，${leaseLabel(r.leaseUntil)}\n`
+    : '空闲\n', { ...r, holderHandle });
+  if (r.held) process.exitCode = 2;
+}
+
+function cmdRelease(c) {
+  const me = resolveSelf(c);
+  const resource = c.positional[0];
+  if (!resource) throw new Error('release 需要 <resource>');
+  const r = claims.release(c.db, { resource, holderSession: me.sessionId });
+  claims.syncMarker(c.db, { kimiHome: c.home, now: c.now });
+  appendLog(c.home, { actor: me.sessionId, action: 'release', detail: resource });
+  if (!r.released) {
+    process.stderr.write('没有属于你的该资源租约\n');
+    process.exitCode = 2;
+    return;
+  }
+  out(c, `已释放 ${render.sanitize(resource, 300)}\n`, r);
+}
+
+function cmdDone(c) {
+  const me = resolveSelf(c);
+  const raw = c.positional[0];
+  if (!raw) throw new Error('done 需要 <postSeq>');
+  const seq = Number(String(raw).replace(/^task:/, ''));
+  if (!Number.isInteger(seq)) throw new Error(`done 需要 <postSeq>，收到 ${raw}`);
+  const resource = `task:${seq}`;
+  const r = claims.complete(c.db, { resource, holderSession: me.sessionId, now: c.now });
+  if (!r.completed) {
+    process.stderr.write(`${resource} 不是由你认领的，或已完成\n`);
+    process.exitCode = 2;
+    return;
+  }
+  if (c.flags.result) {
+    // task 资源可以先于帖子存在（claim 是通用资源），这时按顶层广播主题落一条，
+    // 至少让 --result 的正文不凭空消失。
+    const task = posts.getPost(c.db, { seq });
+    posts.createPost(c.db, {
+      topic: task?.topic ?? ALL_TOPIC,
+      authorSession: me.sessionId, authorCwd: me.cwd, origin: 'agent', kind: 'finding',
+      toSession: task?.authorSession ?? null,
+      title: `task:${seq} 完成`, body: c.flags.result, replyTo: seq, now: c.now,
+    });
+  }
+  claims.syncMarker(c.db, { kimiHome: c.home, now: c.now });
+  appendLog(c.home, { actor: me.sessionId, action: 'done', detail: resource });
+  out(c, `已完结 ${resource}\n`, r);
+}
+
+function cmdTasks(c) {
+  resolveSelf(c);
+  const tasks = posts.openTasks(c.db, { now: c.now });
+  out(c, (tasks.map(t =>
+    `#${t.post.seq}\t${t.post.topic}\t${render.sanitize(t.post.title)}`).join('\n') || '（无开放任务）') + '\n', { tasks });
+}
+
+/** 审计日志只读视图：坏行跳过，缺文件不是错误（审计是尽力而为的旁路）。 */
+function cmdLog(c) {
+  const limit = c.flags.limit == null ? 20 : Number(c.flags.limit);
+  if (!Number.isInteger(limit) || limit <= 0) throw new Error(`--limit 需要正整数，收到 ${c.flags.limit}`);
+  let raw = '';
+  try { raw = readFileSync(join(c.home, 'agent-bus', 'log.jsonl'), 'utf8'); } catch { /* 还没有日志 */ }
+  const entries = [];
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e && typeof e.ts === 'number') entries.push(e);
+    } catch { /* 半行/损坏行跳过 */ }
+  }
+  const latest = entries.slice(-limit).reverse();
+  const human = latest.map(e =>
+    `${new Date(e.ts).toISOString()}\t${render.sanitize(e.actor)}\t${render.sanitize(e.action)}\t${render.sanitize(e.detail, 200)}`
+  ).join('\n') || '（无审计记录）';
+  out(c, human + '\n', latest);
+}
+
 const COMMANDS = {
   whoami: cmdWhoami,
   peers: cmdPeers,
@@ -201,6 +349,12 @@ const COMMANDS = {
   subscribe: (c) => cmdSubscribe(c, true),
   unsubscribe: (c) => cmdSubscribe(c, false),
   subs: cmdSubs,
+  claim: cmdClaim,
+  busy: cmdBusy,
+  release: cmdRelease,
+  done: cmdDone,
+  tasks: cmdTasks,
+  log: cmdLog,
 };
 
 const name = process.argv[2];

@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { openDb } from '../lib/db.mjs';
 import * as id from '../lib/identity.mjs';
 import * as posts from '../lib/posts.mjs';
-import { makeTmpHome, cleanup, runCli } from './helpers.mjs';
+import { CLI, makeTmpHome, cleanup, runCli } from './helpers.mjs';
 
 /**
  * 造一棵假 /proc（不跨测试文件 import，保持本文件自足）。
@@ -40,6 +41,24 @@ function seedHome() {
   id.setWatcher(db, { tuiPid: 100, watcherPid: 500, watcherUntil: 9e15 });
   id.upsertPresence(db, { tuiPid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
   posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+  db.close();
+  return { home, procRoot };
+}
+
+/**
+ * 持有者 handle 撑到 256KB 的家目录：冲突文案（`已被 <handle> 占用，…`）因此必然
+ * 超过管道缓冲（64KB），于是「大 stdout」与「非零退出码」两件事可以同时考。
+ */
+function seedBigHandleHome() {
+  const home = makeTmpHome();
+  const procRoot = join(home, 'proc');
+  seedProc(procRoot, [
+    { pid: 200, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    { pid: 300, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+  ]);
+  const db = openDb(join(home, 'agent-bus', 'bus.db'));
+  id.upsertPresence(db, { tuiPid: 300, sessionId: 'big', sessionTitle: 'big', cwd: '/p/big', handle: 'h'.repeat(256 * 1024) });
+  id.upsertPresence(db, { tuiPid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
   db.close();
   return { home, procRoot };
 }
@@ -163,6 +182,12 @@ test('post --to 命中重名 handle 时报歧义并列出候选，且不落库',
     const db = openDb(join(home, 'agent-bus', 'bus.db'));
     // 模拟 Task 5 修 R-I1 之前可能留下的重名行：两个窗口共用 handle 'dup'。
     // session_id 与 handle 都不等于 'dup'，所以解析只能落在 handle 这一支。
+    // R-O4 之后 CLI 每条命令都会顺带清扫活不下来的 presence 行，所以这两行必须
+    // 在假 /proc 里各有对应的 kimi-code 进程，否则会被当成死窗口删掉。
+    seedProc(procRoot, [
+      { pid: 300, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+      { pid: 301, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' },
+    ]);
     id.upsertPresence(db, { tuiPid: 300, sessionId: 'session_x1', sessionTitle: 'C', cwd: '/p/dup', handle: 'dup' });
     id.upsertPresence(db, { tuiPid: 301, sessionId: 'session_x2', sessionTitle: 'D', cwd: '/p/dup2', handle: 'dup' });
     db.close();
@@ -187,5 +212,226 @@ test('未识别的命令以退出码 1 失败并打印用法', () => {
     const r = runCli(['nope', '--home', home], { home });
     assert.equal(r.status, 1);
     assert.match(r.stderr, /用法/);
+  } finally { cleanup(home); }
+});
+
+// —— Task 8：认领命令、任务列表、审计日志 ——
+// 注意所有 runCli 都带上了 seedHome 造的假 procRoot。R-O4 之后 CLI 的公共路径会跑
+// identity.reapDead，不给 procRoot 时它拿真实 /proc 核对 pid 100/200（那里没有
+// kimi-code），会把刚种下的 presence 行当死窗口删掉，其后的 resolveSelf 全部失败。
+
+test('claim 成功后第二个窗口被拒，退出码 2 且报出持有者', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    const a = runCli(['claim', '/p/agent-com/lib/db.mjs', '--ttl', '30m', '--session', 'me', '--json', '--home', home], { home, procRoot });
+    assert.equal(a.status, 0);
+    assert.equal(JSON.parse(a.stdout).claimed, true);
+
+    const b = runCli(['claim', '/p/agent-com/lib/db.mjs', '--ttl', '30m', '--session', 'other', '--home', home], { home, procRoot });
+    assert.equal(b.status, 2);
+    assert.match(b.stderr, /agent-com/);
+  } finally { cleanup(home); }
+});
+
+test('claim 会同步出 claims.marker，release 后消失', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    const mp = join(home, 'agent-bus', 'claims.marker');
+    assert.equal(existsSync(mp), false);
+    runCli(['claim', '/p/agent-com/x', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(existsSync(mp), true);
+    runCli(['release', '/p/agent-com/x', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(existsSync(mp), false);
+  } finally { cleanup(home); }
+});
+
+test('busy 对空闲资源退出 0，对被占资源退出 2', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    assert.equal(runCli(['busy', '/p/agent-com/x', '--session', 'other', '--home', home], { home, procRoot }).status, 0);
+    runCli(['claim', '/p/agent-com/x', '--session', 'me', '--ttl', '1h', '--home', home], { home, procRoot });
+    const b = runCli(['busy', '/p/agent-com/x', '--session', 'other', '--home', home], { home, procRoot });
+    assert.equal(b.status, 2);
+    assert.match(b.stdout, /agent-com/);
+  } finally { cleanup(home); }
+});
+
+test('--ttl 解析 s/m/h', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    runCli(['claim', '/p/agent-com/x', '--ttl', '2h', '--session', 'me', '--json', '--home', home], { home, procRoot });
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    const row = db.prepare('SELECT lease_until FROM claims WHERE resource = ?').get('/p/agent-com/x');
+    const delta = row.lease_until - Date.now();
+    assert.ok(delta > 7_000_000 && delta <= 7_200_000, `2h 应约等于 7200000ms，实际 ${delta}`);
+    db.close();
+  } finally { cleanup(home); }
+});
+
+test('tasks 列出开放任务，done 之后消失', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    runCli(['post', '--topic', 'agent-com', '--kind', 'request', '--title', '跑 pytest',
+      '--session', 'me', '--json', '--home', home], { home, procRoot });
+    const before = JSON.parse(runCli(['tasks', '--session', 'me', '--json', '--home', home], { home, procRoot }).stdout);
+    assert.equal(before.tasks.length, 1);
+    assert.equal(before.tasks[0].post.title, '跑 pytest');
+
+    assert.equal(runCli(['claim', 'task:1', '--session', 'other', '--home', home], { home, procRoot }).status, 0);
+    const claimed = JSON.parse(runCli(['tasks', '--session', 'me', '--json', '--home', home], { home, procRoot }).stdout);
+    assert.equal(claimed.tasks.length, 0, '被认领的任务不在开放列表里');
+
+    assert.equal(runCli(['done', '1', '--session', 'other', '--home', home], { home, procRoot }).status, 0);
+    const finished = JSON.parse(runCli(['tasks', '--session', 'me', '--json', '--home', home], { home, procRoot }).stdout);
+    assert.equal(finished.tasks.length, 0, '完成的任务不在开放列表里');
+  } finally { cleanup(home); }
+});
+
+test('done 对非本人持有的任务退出码 2', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    runCli(['post', '--topic', 'agent-com', '--kind', 'request', '--title', 'x', '--session', 'me', '--home', home], { home, procRoot });
+    runCli(['claim', 'task:1', '--session', 'other', '--home', home], { home, procRoot });
+    const r = runCli(['done', '1', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(r.status, 2);
+  } finally { cleanup(home); }
+});
+
+test('--ttl 缺省 30m，接受 90s 与纯毫秒，非法值退出码 1', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    const t0 = Date.now();
+    runCli(['claim', '/p/t-default', '--session', 'me', '--home', home], { home, procRoot });
+    runCli(['claim', '/p/t-sec', '--ttl', '90s', '--session', 'me', '--home', home], { home, procRoot });
+    runCli(['claim', '/p/t-ms', '--ttl', '1500', '--session', 'me', '--home', home], { home, procRoot });
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    const leaseOf = res => db
+      .prepare('SELECT lease_until FROM claims WHERE resource = ?').get(res).lease_until - t0;
+    assert.ok(leaseOf('/p/t-default') >= 1_800_000 && leaseOf('/p/t-default') < 1_805_000,
+      `缺省应为 30m，实际 ${leaseOf('/p/t-default')}`);
+    assert.ok(leaseOf('/p/t-sec') >= 90_000 && leaseOf('/p/t-sec') < 95_000,
+      `90s 应为 90000ms，实际 ${leaseOf('/p/t-sec')}`);
+    assert.ok(leaseOf('/p/t-ms') >= 1_500 && leaseOf('/p/t-ms') < 6_500,
+      `纯数字应为毫秒，实际 ${leaseOf('/p/t-ms')}`);
+    db.close();
+
+    const bad = runCli(['claim', '/p/t-bad', '--ttl', '5x', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /ttl/);
+  } finally { cleanup(home); }
+});
+
+test('已完成资源渲染成「已完成」，不打印 1970 时间戳', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    runCli(['post', '--topic', 'agent-com', '--kind', 'request', '--title', 'x', '--session', 'me', '--home', home], { home, procRoot });
+    runCli(['claim', 'task:1', '--session', 'other', '--home', home], { home, procRoot });
+    runCli(['done', '1', '--session', 'other', '--home', home], { home, procRoot });
+
+    const b = runCli(['busy', 'task:1', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(b.status, 2);
+    assert.match(b.stdout, /已完成/);
+    assert.equal(b.stdout.includes('1970'), false, 'leaseUntil 为 null 时不得渲染成 epoch');
+
+    const c = runCli(['claim', 'task:1', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(c.status, 2);
+    assert.match(c.stderr, /已完成/);
+    assert.equal(c.stderr.includes('1970'), false, 'leaseUntil 为 null 时不得渲染成 epoch');
+
+    const j = runCli(['claim', 'task:1', '--session', 'me', '--json', '--home', home], { home, procRoot });
+    assert.equal(j.status, 2);
+    assert.deepEqual(JSON.parse(j.stdout), { claimed: false, holder: 'other', leaseUntil: null });
+  } finally { cleanup(home); }
+});
+
+test('done --result 回一条 finding 给任务发起人', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    runCli(['post', '--topic', 'agent-com', '--kind', 'request', '--title', '跑 pytest', '--session', 'me', '--home', home], { home, procRoot });
+    runCli(['claim', 'task:1', '--session', 'other', '--home', home], { home, procRoot });
+    const r = runCli(['done', '1', '--result', '全绿 87/87', '--session', 'other', '--home', home], { home, procRoot });
+    assert.equal(r.status, 0);
+
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    const reply = db.prepare('SELECT * FROM posts WHERE reply_to = 1').get();
+    db.close();
+    assert.equal(reply.topic, 'agent-com');
+    assert.equal(reply.kind, 'finding');
+    assert.equal(reply.to_session, 'me', '结果定向回任务发起人');
+    assert.equal(reply.author_session, 'other');
+    assert.equal(reply.body, '全绿 87/87');
+  } finally { cleanup(home); }
+});
+
+test('任何命令都顺带清扫死窗口的 presence 行', () => {
+  const home = makeTmpHome();
+  try {
+    const procRoot = join(home, 'proc');
+    seedProc(procRoot, [{ pid: 200, comm: 'kimi-code', ppid: 1, cmdline: 'kimi-code' }]);
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    id.upsertPresence(db, { tuiPid: 100, sessionId: 'me', sessionTitle: 'A', cwd: '/p/agent-com', handle: 'agent-com' });
+    id.upsertPresence(db, { tuiPid: 200, sessionId: 'other', sessionTitle: 'B', cwd: '/p/other', handle: 'other' });
+    db.close();
+
+    assert.equal(runCli(['whoami', '--session', 'other', '--home', home], { home, procRoot }).status, 0);
+
+    const after = openDb(join(home, 'agent-bus', 'bus.db'));
+    const pids = after.prepare('SELECT tui_pid FROM presence ORDER BY tui_pid').all().map(r => r.tui_pid);
+    after.close();
+    assert.deepEqual(pids, [200], 'pid 不在 /proc 里的窗口行应由任何一次 bus 命令清掉');
+  } finally { cleanup(home); }
+});
+
+test('log 读审计日志：最新在前、--limit 生效、缺文件不报错', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    const none = runCli(['log', '--home', home], { home, procRoot });
+    assert.equal(none.status, 0);
+    assert.match(none.stdout, /无审计记录/);
+
+    for (const title of ['t1', 't2', 't3']) {
+      runCli(['post', '--topic', 'agent-com', '--kind', 'finding', '--title', title, '--session', 'me', '--home', home], { home, procRoot });
+    }
+
+    const human = runCli(['log', '--limit', '2', '--home', home], { home, procRoot });
+    const lines = human.stdout.trim().split('\n');
+    assert.equal(lines.length, 2, '--limit 2 只输出两行');
+    assert.match(lines[0], /post\t3 agent-com finding/, '最新的在最前');
+    assert.match(lines[1], /post\t2 agent-com finding/);
+
+    const json = runCli(['log', '--limit', '2', '--json', '--home', home], { home, procRoot });
+    const entries = JSON.parse(json.stdout);
+    assert.ok(Array.isArray(entries), '--json 输出数组');
+    assert.deepEqual(entries.map(e => e.detail), ['3 agent-com finding', '2 agent-com finding']);
+    assert.equal(entries[0].actor, 'me');
+
+    const all = JSON.parse(runCli(['log', '--json', '--home', home], { home, procRoot }).stdout);
+    assert.equal(all.length, 3, '默认取最后 20 条');
+  } finally { cleanup(home); }
+});
+
+test('stdout 被下游提前关闭时，EPIPE 不把退出码 2 改写成 0', () => {
+  const { home, procRoot } = seedBigHandleHome();
+  try {
+    assert.equal(runCli(['claim', '/p/agent-com/x', '--session', 'big', '--home', home], { home, procRoot }).status, 0);
+
+    // 下游（head -c 0）在读之前就关掉读端 → 写必以 EPIPE 失败，这条链不靠时序运气。
+    const r = spawnSync('/bin/bash', ['-c',
+      `"${process.execPath}" "${CLI}" busy /p/agent-com/x --session other --home "${home}" | head -c 0; exit \${PIPESTATUS[0]}`],
+      { encoding: 'utf8', env: { ...process.env, KIMI_CODE_HOME: home, AGENT_BUS_PROC_ROOT: procRoot } });
+    assert.equal(r.status, 2, `EPIPE 处理器必须保留 busy 已置的 2，实际 ${r.status}`);
+  } finally { cleanup(home); }
+});
+
+test('冲突路径上超过管道缓冲的 stdout 也被完整写出（用 exitCode 而非 process.exit）', () => {
+  const { home, procRoot } = seedBigHandleHome();
+  try {
+    runCli(['claim', '/p/agent-com/x', '--session', 'big', '--home', home], { home, procRoot });
+    const r = runCli(['claim', '/p/agent-com/x', '--session', 'other', '--home', home], { home, procRoot });
+    assert.equal(r.status, 2);
+    assert.ok(r.stdout.length > 256 * 1024,
+      `失败路径的 stdout 被截断在管道容量（${r.stdout.length} 字节）`);
+    assert.equal(r.stdout.endsWith('\n'), true, '整行都写完了');
+    assert.ok(r.stderr.length > 256 * 1024, `stderr 同样被截断（${r.stderr.length} 字节）`);
   } finally { cleanup(home); }
 });
