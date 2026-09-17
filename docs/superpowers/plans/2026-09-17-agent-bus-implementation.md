@@ -693,7 +693,9 @@ git commit -m "feat: claims.mjs 原子认领/释放/冲突查询与 marker 同�
   - `openTasks(db, {now, limit = 50}): Array<{post: Post, claim: {holder: string|null, leaseUntil: number|null, completed: boolean}}>`
   - `Post = {seq, topic, authorSession, authorCwd, origin, kind, toSession, title, body, replyTo, ts}`
 
-> **注意：这里修正了 spec §6.3 的一个潜在 bug。** spec 的谓词写的是 `posts.topic LIKE s.pattern || '/%'`，但 `LIKE` 把 `_` 和 `%` 当通配符，而主题路径允许 `_`（`normalizeTopic` 不转义它），于是 `pattern='a_b'` 会误匹配 `'axb'`。本任务改用 `substr(posts.topic, 1, length(s.pattern) + 1) = s.pattern || '/'`，完全避开 LIKE 转义问题。**执行本任务时同步修正 spec §6.3。**
+> **注意：这里修正了 spec 的 LIKE 通配 bug（三处）。** spec 的谓词写的是 `posts.topic LIKE s.pattern || '/%'`，但 `LIKE` 把 `_` 和 `%` 当通配符，而主题路径允许 `_`（`normalizeTopic` 不转义它），于是 `pattern='a_b'` 会误匹配 `'axb'`。本任务改用 `substr(posts.topic, 1, length(s.pattern) + 1) = s.pattern || '/'`，完全避开 LIKE 转义问题。**执行本任务时同步修正 spec 的三处**：§6.3 的过滤谓词、§6.1"通配只支持尾部"那段文字里的同一谓词、以及 §5 索引行 `posts_topic_seq` 里对旧谓词的引用（该行顺带把"可以走索引"的失实说法改成实测结论：谓词不可 sarg，索引只是 `(topic, seq)` 的覆盖索引）。
+>
+> **另外：`Post` 的所有出口都经 `toPost(row)` 映射成普通对象**（`node:sqlite` 的行对象原型是 `null`，不映射会让下游 `assert.deepEqual(post, {…})` 因原型不同而失败）；`listTopics` 的聚合行同理映射成普通对象。同一具名类型在模块内只有一种对象种类。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -840,13 +842,39 @@ test('openTasks 列出未被活跃认领且未完成的 request', () => {
     claim(db, { resource: `task:${t2.seq}`, holderSession: 'sB', ttlMs: 60000, now: 1000 });
     complete(db, { resource: `task:${t2.seq}`, holderSession: 'sB', now: 1001 });
 
+    // now=2000 时 work1 的租约（1000+60000=61000）仍然活跃 ⇒ 不在开放列表；
+    // work2 已完成 ⇒ 也不在。因此期望是空列表 —— 这正是"被活跃认领的
+    // 那条不开放"的语义；finding 帖不进列表由这两次断言一并覆盖。
     const open = posts.openTasks(db, { now: 2000 });
-    assert.deepEqual(open.map(o => o.post.title), ['work1']);
-    assert.equal(open[0].claim.holder, 'sB');
-    assert.equal(open[0].claim.completed, false);
+    assert.deepEqual(open.map(o => o.post.title), []);
+    assert.deepEqual(open.map(o => o.post.title).filter(t => t === 'work1'), [],
+      '被活跃认领的 work1 不在开放列表');
 
     const afterExpiry = posts.openTasks(db, { now: 999999 });
-    assert.deepEqual(afterExpiry.map(o => o.post.title), ['work1', 'work2'].filter(x => x === 'work1' || x === 'work2'));
+    assert.deepEqual(afterExpiry.map(o => o.post.title), ['work1']);
+    assert.equal(afterExpiry[0].claim.holder, 'sB');
+    assert.equal(afterExpiry[0].claim.leaseUntil, 61000);
+    assert.equal(afterExpiry[0].claim.completed, false);
+  });
+});
+
+test('getPost/poll/search/listTopics 的出口都是普通对象', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    seed(db, { title: 'broadcast' });
+    seed(db, { title: 'direct', toSession: 'me' });
+    const r = posts.poll(db, { reader: 'me' });
+    const outs = [
+      ['getPost', posts.getPost(db, { seq: 1 })],
+      ['poll.strong[0]', r.strong[0]],
+      ['poll.weak[0]', r.weak[0]],
+      ['search[0]', posts.search(db, { reader: 'me', text: 'broadcast' })[0]],
+      ['listTopics[0]', posts.listTopics(db)[0]],
+    ];
+    for (const [name, row] of outs) {
+      assert.ok(Object.getPrototypeOf(row) !== null, `${name} 不得是 null-prototype 行对象`);
+      assert.deepEqual(row, { ...row }, `${name} 必须是普通对象`);
+    }
   });
 });
 ```
@@ -861,9 +889,24 @@ Expected: FAIL —— `Cannot find module '../lib/posts.mjs'`
 `lib/posts.mjs`：
 
 ```js
-const COLS = `seq, topic, author_session AS authorSession, author_cwd AS authorCwd,
-              origin, kind, to_session AS toSession, title, body,
-              reply_to AS replyTo, ts`;
+const COLS = `seq, topic, author_session, author_cwd, origin, kind,
+              to_session, title, body, reply_to, ts`;
+
+function toPost(row) {
+  return {
+    seq: row.seq,
+    topic: row.topic,
+    authorSession: row.author_session,
+    authorCwd: row.author_cwd,
+    origin: row.origin,
+    kind: row.kind,
+    toSession: row.to_session,
+    title: row.title,
+    body: row.body,
+    replyTo: row.reply_to,
+    ts: row.ts,
+  };
+}
 
 export function createPost(db, {
   topic, authorSession, authorCwd, origin, kind,
@@ -878,7 +921,8 @@ export function createPost(db, {
 }
 
 export function getPost(db, { seq }) {
-  return db.prepare(`SELECT ${COLS} FROM posts WHERE seq = ?`).get(seq) ?? null;
+  const row = db.prepare(`SELECT ${COLS} FROM posts WHERE seq = ?`).get(seq);
+  return row ? toPost(row) : null;
 }
 
 export function getCursor(db, { reader }) {
@@ -911,9 +955,11 @@ const POLL_SQL = `
 `;
 
 export function poll(db, { reader, limit = 50 }) {
-  const rows = db.prepare(POLL_SQL).all({ cursor: getCursor(db, { reader }), me: reader, limit });
-  const strong = rows.filter(r => r.toSession === reader);
-  const weak = rows.filter(r => r.toSession !== reader);
+  const rows = db.prepare(POLL_SQL)
+    .all({ cursor: getCursor(db, { reader }), me: reader, limit })
+    .map(toPost);
+  const strong = rows.filter(p => p.toSession === reader);
+  const weak = rows.filter(p => p.toSession !== reader);
   const nextCursor = rows.length ? rows[rows.length - 1].seq : getCursor(db, { reader });
   return { strong, weak, nextCursor, total: rows.length };
 }
@@ -931,13 +977,13 @@ export function search(db, { reader, text, limit = 20 }) {
            )
      ORDER BY p.seq DESC
      LIMIT :limit
-  `).all({ like, me: reader, limit });
+  `).all({ like, me: reader, limit }).map(toPost);
 }
 
 export function listTopics(db) {
   return db.prepare(
     'SELECT topic, COUNT(*) AS count, MAX(ts) AS lastTs FROM posts GROUP BY topic ORDER BY lastTs DESC, topic'
-  ).all();
+  ).all().map(r => ({ topic: r.topic, count: r.count, lastTs: r.lastTs }));
 }
 
 export function subscribe(db, { reader, pattern }) {
@@ -966,11 +1012,7 @@ export function openTasks(db, { now, limit = 50 }) {
      LIMIT :limit
   `).all({ now, limit });
   return rows.map(r => ({
-    post: {
-      seq: r.seq, topic: r.topic, authorSession: r.authorSession, authorCwd: r.authorCwd,
-      origin: r.origin, kind: r.kind, toSession: r.toSession, title: r.title,
-      body: r.body, replyTo: r.replyTo, ts: r.ts,
-    },
+    post: toPost(r),
     claim: {
       holder: r.claimHolder ?? null,
       leaseUntil: r.claimLeaseUntil ?? null,
@@ -983,9 +1025,9 @@ export function openTasks(db, { now, limit = 50 }) {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `node --test test/posts.test.mjs`
-Expected: PASS，11 个用例全绿
+Expected: PASS，12 个用例全绿
 
-- [ ] **Step 5: 同步修正 spec §6.3**
+- [ ] **Step 5: 同步修正 spec（§6.3、§6.1 与 §5 索引行三处）**
 
 把 `docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md` 里
 
@@ -999,7 +1041,15 @@ Expected: PASS，11 个用例全绿
                  OR substr(posts.topic, 1, length(s.pattern) + 1) = s.pattern || '/')
 ```
 
-并在该代码块下补一行说明：改用 `substr` 是因为 `LIKE` 会把主题里合法的 `_` 当通配符。
+**同一个谓词在 spec 里有三处，都要改**（本步骤早先只写了"同步修正 §6.3"，漏掉两处，会留下"文档说 LIKE、代码用 substr"的矛盾）：
+
+1. **§6.3** watcher 过滤谓词（上面的代码块）；
+2. **§6.1**"通配只支持尾部"那段文字里的同一谓词；
+3. **§5** 列级约束表里 `posts_topic_seq` 索引行的谓词引文——该行顺带把"**可以走索引**"这个失实说法改掉：`substr(topic, …)` 包裹了索引列、不可 sarg，相关子查询里的 `LIKE pattern || '/%'` 同样不构成前缀搜索，`EXPLAIN QUERY PLAN` 实测走的是 `SEARCH posts USING INTEGER PRIMARY KEY (rowid>?)`；该索引只是 `(topic, seq)` 的覆盖索引。
+
+理由（顺手补在 §6.3 代码块下）：改用 `substr` 是因为 `LIKE` 会把主题里合法的 `_` 当单字符通配符（`normalizeTopic` 放行 `_` 且不转义），于是 `pattern='a_b'` 会误匹配 `'axb'`。
+
+**并在 §6.1 补上主题契约**：写进 `posts.topic` 与 `subs.pattern` 的值**必须**是 `normalizeTopic()` 的输出，规范化由调用方负责（`lib/posts.mjs` 不做），违反的后果是静默不投递。
 
 - [ ] **Step 6: 提交**
 
@@ -3557,8 +3607,10 @@ git commit -m "feat: 限流、64KB 正文上限与 prune 归档（posts 唯一�
 |---|---|---|
 | §5 五张表与 CHECK 约束 | Task 1 | ✅ |
 | §5 原子认领 SQL（`ON CONFLICT ... WHERE (completed_at IS NULL AND lease_until <= :now) OR (completed_at IS NULL AND holder_session = :holder)`）—— 已完成的行永不可再被认领，无论租约是否过期 | Task 3 | ✅ **R2 修正**；该不变量由 R-E2 的 `releaseAllForSession` 收口（SessionEnd 只回收未完结的租约，已完成的行留下） |
-| §5 开放任务查询 | Task 4 `openTasks` | ✅ |
+| §5 开放任务查询 | Task 4 `openTasks` | ✅ **R3 修正期望值**：只返回"未被活跃认领、也未完成"的 `request`——被活跃认领的（`lease_until > :now`）与已完成的（`completed_at` 非空）都**不在**开放列表，故 `now=2000` 期望 `[]`、`now=999999` 期望 `['work1']`（brief 早先写的 `['work1']` 与自消式 `.filter(x => x === 'work1' \|\| x === 'work2')` 是错的，后者恒等于要求已完成的任务也开放） |
 | §6.1 层级主题与前缀订阅 | Task 2 + Task 4 `poll` | ✅ |
+| §6.1 主题前缀谓词（不用 `LIKE`） | Task 4 | ✅ **三处同改**（§6.1 文字、§6.3 谓词、§5 索引行的谓词引文）。`LIKE` 把主题里合法的 `_` 当单字符通配符 ⇒ 改用 `substr(topic, 1, length(pattern) + 1) = pattern \|\| '/'`；§5 索引行顺带删掉了"可以走索引"的失实说法（该谓词不可 sarg） |
+| §6.1 入库 `topic` 与 `subs.pattern` 必须先过 `normalizeTopic` | Task 2 提供 `normalizeTopic`；Task 4 的 `lib/posts.mjs` **不做**规范化（契约由调用方负责） | ✅ spec §6.1 已写明契约与违反后果（静默不投递） |
 | §6.3 过滤谓词 | Task 4 | ✅ **并修正了 LIKE 通配 bug** |
 | §6.4 `kind` 两取值、`origin` 两取值 | Task 1 CHECK 约束 | ✅ |
 | §6.4 两级读取（triage 行 / 按需取正文） | Task 6 + Task 10 | ✅ |
@@ -3581,7 +3633,8 @@ git commit -m "feat: 限流、64KB 正文上限与 prune 归档（posts 唯一�
 
 **3. 类型与命名一致性**（逐个核对）：
 
-- `Post` 的字段名在 `lib/posts.mjs`（camelCase 映射）、`lib/render.mjs`（读 `post.toSession`/`post.authorCwd`）、`lib/posts.mjs#openTasks`（手工重建对象）三处一致。
+- `Post` 的字段名在 `lib/posts.mjs`（统一经 `toPost(row)` 做 snake_case → camelCase 映射）、`lib/render.mjs`（读 `post.toSession`/`post.authorCwd`）、`lib/posts.mjs#openTasks`（同样用 `toPost`）三处一致。
+- **`Post` 的出口只有一种对象种类（R-F1）**：`getPost` / `poll.strong` / `poll.weak` / `search` / `openTasks.post` 全部经 `toPost(row)` 返回**普通对象**，聚合出口 `listTopics` 亦映射成普通对象。`node:sqlite` 的行对象原型是 `null`，放任其直接出模块会让下游 `assert.deepEqual(post, {…字面量})` 因原型不同而失败——`test/posts.test.mjs` 的"出口都是普通对象"用例钉住了这条（用 R-F1 之前的 `lib/posts.mjs` 跑它必失败，已实测）。
 - `presence` 行对象在 `lib/identity.mjs#listPresence` 里是 `{tuiPid, sessionId, sessionTitle, cwd, handle, watcherPid, watcherUntil, alive, deaf}`；`bin/bus.mjs#rowRow` 产出的是不含 `alive/deaf` 的版本，**这是有意的**——`resolveSelf` 只返回身份，聋状态由调用方另取 `listPresence`。任务 7 的 `cmdWhoami` 正是这么用的。
 - `claims.claim` 的返回签名在所有调用点一致：`{claimed, holder, leaseUntil}`。
 - `digestBlock` 的参数名 `{strong, weak, total, reader, pluginRoot, deaf}` 在 Task 6、Task 7、Task 10 三处一致。

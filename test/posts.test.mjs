@@ -153,3 +153,23 @@ test('openTasks 列出未被活跃认领且未完成的 request', () => {
     assert.equal(afterExpiry[0].claim.completed, false);
   });
 });
+
+test('getPost/poll/search/listTopics 的出口都是普通对象', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    seed(db, { title: 'broadcast' });
+    seed(db, { title: 'direct', toSession: 'me' });
+    const r = posts.poll(db, { reader: 'me' });
+    const outs = [
+      ['getPost', posts.getPost(db, { seq: 1 })],
+      ['poll.strong[0]', r.strong[0]],
+      ['poll.weak[0]', r.weak[0]],
+      ['search[0]', posts.search(db, { reader: 'me', text: 'broadcast' })[0]],
+      ['listTopics[0]', posts.listTopics(db)[0]],
+    ];
+    for (const [name, row] of outs) {
+      assert.ok(Object.getPrototypeOf(row) !== null, `${name} 不得是 null-prototype 行对象`);
+      assert.deepEqual(row, { ...row }, `${name} 必须是普通对象`);
+    }
+  });
+});

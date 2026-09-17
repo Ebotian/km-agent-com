@@ -150,7 +150,7 @@ subs(reader_session TEXT, pattern TEXT,     -- 'agent-com'（含子树）、'age
 | `NOT NULL` | `subs.reader_session` / `subs.pattern` | 两者同为主键，缺一不可 |
 | `CHECK (origin IN ('human','agent'))` | `posts.origin` | 依据 §6.4：取值域是**闭合**的——原设计的第三个取值 `system` 已删除（插件不往总线发帖） |
 | `CHECK (kind IN ('request','finding'))` | `posts.kind` | 依据 §6.4：只有两种内容类型，`answer` / `status` / `note` 三个取值已删除 |
-| 索引 `posts_topic_seq(topic, seq)` | `posts` | 依据 §6.1：订阅谓词是 `topic = pattern OR substr(topic, 1, length(pattern) + 1) = pattern || '/'`（为什么**不用 `LIKE`** 见 §6.1）；该索引是这两列的覆盖索引，第二列 `seq` 支撑按主题的游标顺序扫描 |
+| 索引 `posts_topic_seq(topic, seq)` | `posts` | 依据 §6.1：订阅谓词是 `topic = pattern OR substr(topic, 1, length(pattern) + 1) = pattern || '/'`（为什么**不用 `LIKE`** 见 §6.1）。该谓词**不可 sarg**（`substr` 包裹了索引列；相关子查询里的 `LIKE pattern \|\| '/%'` 同样不构成前缀搜索）——`EXPLAIN QUERY PLAN` 实测走的是 `SEARCH posts USING INTEGER PRIMARY KEY (rowid>?)`；本索引是 `(topic, seq)` 的覆盖索引 |
 
 **方向是"更严"，不是"不同"**：列名与列序与上面的 SQL 块逐字一致，这里只是把原先仅写在注释里的取值域、以及隐含的非空前提，提升为强制约束。因此按 SQL 块以为可以传 NULL 的调用方会在运行时报错（`node:sqlite` 把未绑定的 `undefined` 绑成 NULL，漏传参数同样会撞上 NOT NULL）。
 
@@ -205,6 +205,8 @@ general
 | `@全体（全机）` | 发到 `topic = 'all'`——**默认无人订阅**，所以默认无人收到 |
 | `@特定 agent` | `to_session = <session_id>`——点名，驱动 L1 |
 | 订阅 | `subs.pattern = 'agent-com'`——前缀匹配，含整棵子树 |
+
+**入库前必须规范化**：写进 `posts.topic` 与 `subs.pattern` 的值**必须**是 `normalizeTopic()` 的输出，规范化由**调用方**负责——`lib/posts.mjs` 只做纯字符串比较，不做规范化（`lib/topic.mjs` 的 `matches()` 同样只比较、不规范化）。违反的后果是**静默不投递**：`createPost({topic:'Agent-Com'})` 会把 `Agent-Com` 原样入库，而 `subscribe({pattern:'agent-com'})` 永远收不到它（反向同理）。DDL 里没有主题格式的 CHECK，所以这条只能由调用方守住。
 
 **三点收益，本质都是"少一条规则"**：
 
