@@ -301,3 +301,40 @@ test('poll：点名给别人的帖子仍按订阅投给我', () => {
     assert.deepEqual(r.weak.map(p => p.title), ['to-other', 'broadcast']);
   });
 });
+
+/**
+ * `poll` 的两个上限以前是**唯一没有输入校验的入口**（`pruneTopic` 校验 `keep`、`createPost`
+ * 校验 title/正文），于是显式传负数就会炸在一个离现场很远的地方：`strongLimit = -1` ⇒
+ * `LIMIT cap + 1 = 0` ⇒ 查询返回空数组 ⇒ `0 > -1` 成立 ⇒ `strongRows[-1]` 是 undefined ⇒
+ * 读 `.seq` 抛 `TypeError: Cannot read properties of undefined (reading 'seq')`——错误信息
+ * 里既没有 `poll` 也没有 `strongLimit`。负小数/NaN 是另一种写法：SQLite 直接回
+ * `datatype mismatch`。两者都该在入口处被一条说清楚的消息挡下。
+ *
+ * **`0` 必须放行**：它是合法值（"这一轴本轮不投"）。`LIMIT 1` 取回的那条正是溢出点，
+ * `slice(0, 0)` 投出 0 条，`ackUpTo` 停在游标处——"游标不推进 + hidden > 0 + total > 0"，
+ * 正是背压该有的样子。把 `0` 一并拒掉会让调用方没法表达"本轮先不投这一轴"。
+ */
+test('poll 拒绝负数/非整数的上限，但放行 0', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    seed(db, { title: 'w1' });
+    seed(db, { title: 'd1', toSession: 'me' });
+
+    for (const bad of [-1, -0.5, NaN]) {
+      assert.throws(() => posts.poll(db, { reader: 'me', strongLimit: bad }),
+        err => err instanceof Error && /strongLimit/.test(err.message),
+        `strongLimit=${bad} 必须被拒且错误信息里带得上限的名字`);
+      assert.throws(() => posts.poll(db, { reader: 'me', weakLimit: bad }),
+        err => err instanceof Error && /weakLimit/.test(err.message),
+        `weakLimit=${bad} 必须被拒且错误信息里带得上限的名字`);
+    }
+
+    // 0 不抛，且行为是"这一轴本轮不投、游标不推进"
+    const r = posts.poll(db, { reader: 'me', strongLimit: 0, weakLimit: 0 });
+    assert.equal(r.strong.length, 0);
+    assert.equal(r.weak.length, 0);
+    assert.equal(r.ackUpTo, 0, '两轴都不投时游标必须原地不动');
+    assert.ok(r.strongHidden > 0 && r.weakHidden > 0);
+    assert.ok(r.total > 0, 'total 要承诺"有东西可展示或有东西被藏起来"');
+  });
+});
