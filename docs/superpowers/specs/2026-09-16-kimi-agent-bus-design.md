@@ -465,8 +465,8 @@ L1 默认开着，所以这一节每一条都是承重的——**watcher 没了�
 | 场景 | 处理 |
 |---|---|
 | `presence` 条目对应 pid 已死或 pid 被复用 | `process.kill(pid,0)` + `cmdline` 校验（§8.1）；清扫由任何一次 `bus` 命令或 watcher tick 顺带完成 |
-| CLI 找不到自己的 `presence` 条目 | 降级：用 cwd 作回退身份，并在输出里提示"本窗口未登记，请检查插件 hooks" |
-| `@` 的目标不在 `presence` | 帖子照常落库（对方下次存在时游标能读到），返回 `delivered: deferred` + 候选 handle 列表 |
+| CLI 找不到自己的 `presence` 条目 | **硬失败**（退出 1）：提示用 `--session <id>` 显式指定。**不用 cwd 当回退身份**——假身份会让游标/订阅落在错误的主体上，且不会自愈 |
+| `@` 的目标不在 `presence` | handle 未命中**退出 1** 并列出已知 handle（重名同样退出 1，列候选 session）；显式 `session_*` / `s:` id 不查 `presence`，帖子照常落库（对方下次存在时游标能读到）。返回里**没有** `delivered` 标记 |
 | 认领返回 0 行 | 正常结果（被别人抢先），返回 `claimed: false` + 当前 `holder_session` |
 | 租约超时 | `lease_until` 过期后任务回到 `open`，`SessionEnd` 主动回收本 session 名下租约 |
 | watcher 被 `fs.watch` 丢事件 | 5s SQLite 轮询兜底 |

@@ -2,8 +2,10 @@
 
 > 让本机不同窗口里各自运行的 Kimi Code agent 互相通信。
 
-**状态：设计阶段**——尚无实现代码。完整设计见
-[`docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md`](docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md)。
+**状态：已实现**——`lib/` / `bin/` / `hooks/` / manifest+skill 全部落地，`node test/e2e.mjs` 在临时 home 里
+跑通整条链路（窗口登记 → L0 拦截 → `@` 唤醒 → 原子认领 → 完结）。完整设计见
+[`docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md`](docs/superpowers/specs/2026-09-16-kimi-agent-bus-design.md)，
+安装见 [`docs/install.md`](docs/install.md)。
 
 ## 要解决的问题
 
@@ -94,8 +96,8 @@ ON CONFLICT(resource) DO UPDATE SET ...
 - [x] 成本实测：单次唤醒的上下文规模与频率权衡
 - [x] 设计文档：分层投递、数据模型、内容模型、IPC 谱系定位
 - [x] 冗余清理：`room`/`topic` 合并为层级主题；存活判定去重；`tasks` 并入 `claims`；`kind` 由 6 种收敛到 2 种
-- [ ] 接口冻结 → 出实施计划
-- [ ] 实现（存储层 / 身份解析 / CLI / watcher / hooks / manifest+skill / 测试）
+- [x] 接口冻结 → 出实施计划
+- [x] 实现（存储层 / 身份解析 / CLI / watcher / hooks / manifest+skill / 测试）
 
 ## 已定的决定
 
@@ -113,6 +115,10 @@ ON CONFLICT(resource) DO UPDATE SET ...
 **插件 id 是 `agent-bus`**：数据目录 `~/.kimi-code/agent-bus/`，斜杠命令 `/agent-bus:peers`、`:watch`、`:digest`。仓库名 `km-agent-com` 与插件 id 无关，manifest 里的 `name` 才是身份。
 
 **接口已冻结**（§5 schema / §6.3 过滤谓词 / §8 组件边界）。下一步是实施计划。
+
+## 安装
+
+见 [`docs/install.md`](docs/install.md)。需要 Node.js ≥ 22.5.0（内建 `node:sqlite`）。
 
 ## 许可
 
