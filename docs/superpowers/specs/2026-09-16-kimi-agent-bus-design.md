@@ -403,6 +403,14 @@ agent-com/                           插件根（仓库）
 
 "调用时解析"的好处：用户在同一窗口 `/new` 切会话后，`presence` 与默认订阅被新的 SessionStart 覆盖，身份自动跟着变。
 
+**但"覆盖"这件事对删除侧有硬约束（R-E5）**：`presence` 以 `tui_pid` 为主键，`/new` 的动作顺序是「先 start 新会话（同一 pid 上 upsert 覆盖）、**后** end 旧会话」，所以 `SessionEnd` 的删除判据只能是「那一行还是我的吗」（`WHERE tui_pid = ? AND session_id = ?`），**不能**是「这个 pid 还在吗」。按 pid 删的实测后果（2026-09-17 生产现场）：旧会话的 end 把新会话刚写好的行连同它刚武装的 watcher 登记一起抹掉，于是**凡走过 `/new` 的窗口都登记不上**，`peers`/`whoami`/`claim`/`post` 全部报"本窗口未在 presence 中登记"——`presence` 0 行而 `subs` 2 行就是它的指纹。载荷里 `session_id` 缺失或为空时**跳过删除**并留一行审计：删错的那一行没人能补回来（窗口不会因为别人删了它就去重跑 `SessionStart`），而留一行陈旧登记会被 `reapDead` 或下一个 `SessionStart` 收敛。按 pid 判死活的那条路径（被 SIGKILL 的窗口不会有 `SessionEnd`）是另一条语义，代码里也是一个单独的函数（`reapPresence`），不许与前者共用一个入口。
+
+`SessionEnd` 也**不**删 `subs` / `read_cursor`：会话可能被 resume，删了会丢掉已读位置、导致重读老消息；陈旧的 `subs` 行无害（按 `session_id` 键，没人会去读它）。
+
+**同一个判据也管 watcher 登记（R-E6）**：`upsertPresence` 只在**会话真的换了**时才清 `watcher_pid` / `watcher_until`；`session_id` 没变（`source=resume` 恢复同一会话就是它）就**保留**。无条件清掉的后果是一条链：旧 watcher 很可能**还在跑** ⇒ 窗口被判成"从未武装" ⇒ 自愈逻辑**再武装一个** ⇒ 同一窗口两个 watcher 抢同一条消息（每次命中都是整上下文重读的成本，§3.3），而且 `peers` 里那个窗口的 watcher 状态是假的。反过来"保留"方向永远安全：watcher 真死了时 `deafState` 判成 `'dead'`，自愈照常重新武装。实现是一条 SQL 的 `CASE`（`CASE WHEN presence.session_id = excluded.session_id THEN presence.watcher_pid ELSE NULL END`；`DO UPDATE` 里 `presence.` 指**旧行**、`excluded.` 指新行）——没有"先查再写"的间隙，也不需要事务：`registerPresence` 已经在 `BEGIN IMMEDIATE` 里调它，而 SQLite 不支持嵌套事务。
+
+**这一条与 `SessionEnd` 的删除是同一条判据**："这一行还是我的吗"——按 `session_id` 比，而不是按"这个 pid 还在吗"。
+
 handle 默认取 cwd 的 basename（如 `agent-com`、`kimi-research`），冲突时加后缀；handle 只是给人看的 `@` 别名，真实身份始终是 `session_id`。
 
 **存活判定：不靠心跳，靠现查。** 原设计用 `SessionHeartbeat` hook（每 60s）+ `presence.heartbeat_at` 判活——这是冗余的。`SessionHeartbeat` 的定时器**每 60 秒会在每个窗口拉起一个 node 进程**（冷启动约 40ms），只为写一个时间戳，正是本设计一直在批评的"急切"做法。同一件事可以零成本现查：
@@ -425,7 +433,7 @@ manifest 里 `command` 写 `node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"`（shell
 |---|---|---|---|
 | **`PreToolUse`** | `Write\|Edit\|Bash` | **L0 访问点强制**：检查本次要碰的资源是否被 `claim` 占用，冲突即拒绝 | exit 2 + stderr 说明 → 工具被拒，原因进上下文 |
 | `SessionStart` | — | 祖先遍历 → upsert `presence`（含 handle）+ 种下默认订阅 | 无（只要副作用） |
-| `SessionEnd` | — | 删除 `presence` 行；回收该 session 名下的 `claims` 租约 | 无 |
+| `SessionEnd` | — | 删除**本会话自己**那一行 `presence`（`tui_pid` + `session_id` 两个判据，见 §8.1 R-E5；载荷缺 `session_id` 则跳过并留审计）；回收该 session 名下的 `claims` 租约；**不**动 `subs` / `read_cursor` | 无 |
 | `UserPromptSubmit` | — | ① 注入未读摘要（L2 弱投递）② **自愈检查**：本窗口 watcher 不在就提醒模型重新武装 | exit 0 + stdout 文本 → `<hook_result>` user 消息 |
 
 四个事件里只有 `PreToolUse` 与 `UserPromptSubmit` 有返回值语义，另外两个纯做副作用。
@@ -462,7 +470,7 @@ L1 默认开着，所以这一节每一条都是承重的——**watcher 没了�
   node $KIMI_PLUGIN_ROOT/bin/bus.mjs watch --session <id> --timeout 43200
   ```
 
-- **幂等**：武装前先 `bus whoami --json` 检查本 session 是否已有活着的 watcher，有就不重复起——避免多个 watcher 抢同一条消息。
+- **幂等**：武装前先 `bus whoami --json` 检查本 session 是否已有活着的 watcher，有就不重复起——避免多个 watcher 抢同一条消息。这条检查的前提是登记不会被无故清掉：`SessionStart` 对**同一会话**的重复登记（`source=resume`）会保留已有登记（§8.1 R-E6），所以 `deaf === null` 的结论是可信的。
 - **三种聋状态，都必须可检测**：
 
   | 状态 | 表现 | 检测方式 |
@@ -530,7 +538,7 @@ v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历�
 - **DB 集成**：多进程并发投递不丢不重（照 §3.3 的 F15 探针扩展）、WAL 崩溃恢复、`SQLITE_BUSY` 重试、schema 迁移。
 - **并发认领**：N 个进程同时认领同一任务，断言恰好一个成功。
 - **watcher**：命中强唤醒即退出；命中弱投递不退出只累加；`fs.watch` 失效时轮询兜底仍能唤醒。
-- **hook**：喂 stdin JSON，断言 exit code / stdout / `presence` 变化；`PreToolUse` 的拒绝路径与 fail-open 路径；**必须有一条用引擎真实载荷形状（`tool_input.path`）的用例**——键名写错等于 L0 对 `Write`/`Edit` 静默全灭，且这是唯一能防住它复发的钉子；路径归一化（相对路径按 `payload.cwd`、`./`、`//`、重定向目标）与"抠不出路径也留一行审计"；`UserPromptSubmit` 的自愈提示与弱投递送达。
+- **hook**：喂 stdin JSON，断言 exit code / stdout / `presence` 变化；`PreToolUse` 的拒绝路径与 fail-open 路径；**必须有一条用引擎真实载荷形状（`tool_input.path`）的用例**——键名写错等于 L0 对 `Write`/`Edit` 静默全灭，且这是唯一能防住它复发的钉子；路径归一化（相对路径按 `payload.cwd`、`./`、`//`、重定向目标）与"抠不出路径也留一行审计"；`UserPromptSubmit` 的自愈提示与弱投递送达；**必须有一条 `/new` 交错（`start(new)` 之后 `end(old)`）的用例**——按 pid 删 presence 行的后果是"凡走过 `/new` 的窗口都登记不上"，而 `/new` 是最日常的路径，见 §8.1 R-E5；载荷缺 `session_id` 的 `SessionEnd` 必须断言"一行都没删 + 留了审计"；`SessionStart` 对**同一会话**的重复登记必须断言 watcher 登记**没被清**（R-E6）、对**换了会话**的登记必须断言被清。
 - **存活判定**：伪造 pid 复用场景（用另一个非 kimi 进程占住 pid）断言不会误判为活窗口。
 - **端到端（必须做）**：开 A、B 两个真实窗口，覆盖——B 空闲时 `@B` 秒级送达；B 忙时消息留存、**在用户下一次回到 B 时经 `UserPromptSubmit` 投递**（不做 `Stop` 注入，见 §7）；B 未开时消息留存并在 B 下次启动后被读到；用户回到 B 时 `UserPromptSubmit` 投递未读；watcher 被杀后的自愈。
 

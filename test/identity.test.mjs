@@ -136,6 +136,56 @@ test('listPresence 标出三种聋状态与存活', () => {
   } finally { cleanup(home); cleanup(root); }
 });
 
+/**
+ * R-E6：`upsertPresence` 只在**会话真的换了**时才清 watcher 登记，判据与 `removePresence`
+ * 是同一句话——"这一行还是我的吗"（`presence.session_id = excluded.session_id`）。
+ *
+ * `source=resume` 恢复同一会话时旧 watcher 很可能**还在跑**：无条件清掉登记 ⇒ 窗口被判成
+ * "从未武装" ⇒ 自愈逻辑**再武装一个** ⇒ 同一窗口两个 watcher 抢同一条消息（每次命中都是
+ * 整上下文重读的成本），`peers` 里的 watcher 状态也是假的。
+ *
+ * 反过来测才是这条的关键：**保留是安全的**——watcher 真死了 `deafState` 会判 `'dead'`，
+ * 自愈照常重新武装。
+ */
+test('R-E6：upsertPresence 在会话没变时保留 watcher 登记（resume 同一会话）', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    const until = Date.now() + 3_600_000;
+    id.upsertPresence(db, { tuiPid: 7, sessionId: 'A', sessionTitle: 'x', cwd: '/p', handle: 'p' });
+    id.setWatcher(db, { tuiPid: 7, watcherPid: 500, watcherUntil: until });
+
+    id.upsertPresence(db, { tuiPid: 7, sessionId: 'A', sessionTitle: 'y', cwd: '/p2', handle: 'p2' });
+
+    const row = db.prepare('SELECT * FROM presence WHERE tui_pid = 7').get();
+    assert.equal(row.watcher_pid, 500, '同一会话 ⇒ watcher 登记必须留着');
+    assert.equal(row.watcher_until, until, '租约也要原样保留（不是清成 NULL，也不是重算）');
+    // 其余列的覆盖语义不能因此失效（题面/标题/cwd/handle 照常刷新）
+    assert.equal(row.session_title, 'y');
+    assert.equal(row.cwd, '/p2');
+    assert.equal(row.handle, 'p2');
+    assert.equal(db.prepare('SELECT COUNT(*) AS c FROM presence').get().c, 1, '仍然只有一行');
+  } finally { cleanup(home); }
+});
+
+test('R-E6：upsertPresence 在会话真的换了时清掉 watcher 登记（/new）', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.upsertPresence(db, { tuiPid: 7, sessionId: 'A', sessionTitle: 'x', cwd: '/p', handle: 'p' });
+    id.setWatcher(db, { tuiPid: 7, watcherPid: 500, watcherUntil: Date.now() + 3_600_000 });
+    // 前置：夹具必须真的先"在听"，否则下面两条断言会退化成空断言
+    assert.equal(db.prepare('SELECT watcher_pid FROM presence WHERE tui_pid = 7').get().watcher_pid, 500);
+
+    id.upsertPresence(db, { tuiPid: 7, sessionId: 'B', sessionTitle: 'z', cwd: '/p', handle: 'p' });
+
+    const row = db.prepare('SELECT * FROM presence WHERE tui_pid = 7').get();
+    assert.equal(row.session_id, 'B');
+    assert.equal(row.watcher_pid, null, '换了会话 ⇒ 旧 watcher 登记（属于会话 A）必须清掉');
+    assert.equal(row.watcher_until, null, '两个列一起清，别留下一个"孤儿"租约');
+  } finally { cleanup(home); }
+});
+
 test('upsertPresence 按 tui_pid 覆盖而非插入新行', () => {
   const home = makeTmpHome();
   try {
@@ -146,6 +196,43 @@ test('upsertPresence 按 tui_pid 覆盖而非插入新行', () => {
     assert.equal(rows.length, 1);
     assert.equal(rows[0].sessionId, 'new');
     assert.equal(rows[0].watcherPid, null, '换会话后旧 watcher 登记应被清掉');
+  } finally { cleanup(home); }
+});
+
+/**
+ * `presence` 以 `tui_pid` 为主键，而 `/new` 会在同一 pid 上换掉 `session_id`——所以
+ * "按 pid 删"和"删我自己的行"是两件事。这条把两者分开钉住：
+ *
+ * - `removePresence` **必须**带 `sessionId`（缺了直接抛）：留着"只按 pid 删"的能力，就一定
+ *   会再被误用一次（这一轮的 bug 就是这么来的）；删不到自己的那一行时返回 0，什么都不动。
+ * - `reapPresence` 才是"这个 pid 已经不是活窗口"那条路径（被 SIGKILL 的窗口不会有
+ *   `SessionEnd`，那一行再没有主人，只能按 pid 判），`reapDead` 用的就是它。
+ */
+test('removePresence 只删自己会话那一行；按 pid 单删的能力收进 reapPresence', () => {
+  const home = makeTmpHome();
+  try {
+    const db = openDb(join(home, 'bus.db'));
+    id.registerPresence(db, { tuiPid: 1, sessionId: 's_old', sessionTitle: '', cwd: '/p/a' });
+    id.registerPresence(db, { tuiPid: 2, sessionId: 's_other', sessionTitle: '', cwd: '/p/b' });
+    // /new 之后：同一 pid 上已经是新会话
+    id.registerPresence(db, { tuiPid: 1, sessionId: 's_new', sessionTitle: '', cwd: '/p/a' });
+
+    assert.equal(id.removePresence(db, { tuiPid: 1, sessionId: 's_old' }), 0,
+      '旧会话的 end 删不到新会话那一行（0 行受影响）');
+    assert.deepEqual(
+      id.listPresence(db, { now: 0, procRoot: '/nonexistent' }).map(r => r.sessionId).sort(),
+      ['s_new', 's_other'], '两行都该还在');
+
+    assert.equal(id.removePresence(db, { tuiPid: 1, sessionId: 's_new' }), 1, '自己的行照常删得掉');
+    assert.throws(() => id.removePresence(db, { tuiPid: 2 }), /需要 sessionId/,
+      '按 pid 单删的入口不许留在 removePresence 上');
+    assert.throws(() => id.removePresence(db, { tuiPid: 2, sessionId: '' }), /需要 sessionId/);
+    assert.deepEqual(id.listPresence(db, { now: 0, procRoot: '/nonexistent' }).map(r => r.sessionId), ['s_other'],
+      '抛出的两次都不该改动任何一行');
+
+    // reapDead 那条路径只按 pid 判：pid 不在假 /proc 里 ⇒ 那一行必须被回收（与它的 session 是谁无关）
+    assert.equal(id.reapDead(db, { procRoot: '/nonexistent' }), 1);
+    assert.deepEqual(id.listPresence(db, { now: 0, procRoot: '/nonexistent' }), []);
   } finally { cleanup(home); }
 });
 

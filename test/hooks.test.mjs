@@ -57,7 +57,19 @@ test('SessionStart 登记 presence 并种下默认订阅', () => {
   } finally { cleanup(home); }
 });
 
-test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登记', () => {
+/**
+ * 同一窗口重复 `SessionStart`：不产生第二行、不抖动 handle，也**不动** watcher 登记（R-E6）。
+ *
+ * 后半句是本轮裁决改掉的语义：以前 `upsertPresence` **无条件**把 `watcher_pid`/`watcher_until`
+ * 清成 NULL，本用例第 81 行原来断言的正是那个旧行为（`watcher_pid === null`）。但这条形态
+ * ——同一 `session_id` 再登记一次（`source=resume` 恢复同一会话就是它）——旧 watcher 很可能
+ * **还在跑**：清掉登记 ⇒ 窗口被判成"从未武装" ⇒ 自愈逻辑再武装一个 ⇒ 同一窗口两个 watcher
+ * 抢同一条消息（每次命中都是整上下文重读）。判据与 `removePresence` 同一句话："这一行还是
+ * 我的吗"。
+ *
+ * "换了会话才清"那一半仍然钉在上面第 68 行（`session_old` → `SESSION`）。
+ */
+test('SessionStart 重复触发不产生重复 presence、不抖动 handle，且保留同一会话的 watcher 登记', () => {
   const home = makeTmpHome();
   try {
     // 旧会话 + 一个健康 watcher（假 /proc 里有对应的 bus-watch 条目）
@@ -66,7 +78,7 @@ test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登�
 
     const db = dbOf(home);
     assert.equal(db.prepare('SELECT watcher_pid FROM presence WHERE tui_pid = ?').get(ME_PID).watcher_pid, null,
-      'SessionStart 必须清掉旧 watcher 登记（新会话还没武装）');
+      '换了会话 ⇒ 旧 watcher 登记必须清掉（新会话还没武装）');
     identity.setWatcher(db, { tuiPid: ME_PID, watcherPid: 555, watcherUntil: 9e15 });
     db.close();
 
@@ -78,8 +90,45 @@ test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登�
     const row = db2.prepare('SELECT * FROM presence WHERE tui_pid = ?').get(ME_PID);
     assert.equal(row.session_id, SESSION);
     assert.equal(row.handle, HANDLE, 'R-H2：重复开窗不许抖动 handle');
-    assert.equal(row.watcher_pid, null);
+    assert.equal(row.watcher_pid, 555,
+      'R-E6：同一会话重复登记不许清 watcher（旧 watcher 还在跑；清了会让自愈逻辑再武装一个）');
     db2.close();
+  } finally { cleanup(home); }
+});
+
+/**
+ * R-E6 的端到端形状（真 hook + 真 CLI）：武装 watcher → **resume 同一会话** → `whoami --json`
+ * 的 `deaf` 仍是 `null`（"在听"），而不是 `'never'`。
+ *
+ * 这一条直接对应 skill 的幂等前提：`deaf === null` 是"不要重复武装"的唯一判据
+ * （`skills/agent-bus/SKILL.md`）。它一旦被误报成 `'never'`，agent 就会再起一个 watcher，
+ * 于是同一窗口两个 watcher 抢同一条消息——每次命中都是整上下文重读。
+ */
+test('R-E6：resume 同一会话后 watcher 登记与 deaf 状态都不变', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home, { watcherPid: 555 });
+    const before = runCli(['whoami', '--json', '--tui-pid', String(ME_PID)],
+      { home, procRoot: procRootOf(home) });
+    assert.equal(before.status, 0, before.stderr);
+    assert.equal(JSON.parse(before.stdout).deaf, null, '前置：夹具先要真的是"在听"');
+
+    const r = runHook(event('SessionStart', { session_title: 'T', source: 'resume' }),
+      { home, tuiPid: ME_PID });
+    assert.equal(r.status, 0, r.stderr);
+
+    const db = dbOf(home);
+    const row = db.prepare('SELECT * FROM presence WHERE tui_pid = ?').get(ME_PID);
+    db.close();
+    assert.equal(row.session_id, SESSION);
+    assert.equal(row.watcher_pid, 555, 'resume 同一会话不许清掉 watcher 登记');
+
+    const after = runCli(['whoami', '--json', '--tui-pid', String(ME_PID)],
+      { home, procRoot: procRootOf(home) });
+    assert.equal(after.status, 0, after.stderr);
+    const me = JSON.parse(after.stdout);
+    assert.equal(me.deaf, null, `deaf 必须仍是 null（在听），报成 ${JSON.stringify(me.deaf)} 会让 skill 再武装一个`);
+    assert.equal(me.watcherPid, 555);
   } finally { cleanup(home); }
 });
 
@@ -116,6 +165,110 @@ test('SessionEnd 删除 presence、回收未完结租约，且已完结的任务
     assert.equal(posts.openTasks(db2, { now: now + 1 }).length, 0, '已完结的任务不得回到开放队列');
     const again = claims.claim(db2, { resource: task, holderSession: 'someone-else', ttlMs: 60000, now: now + 1 });
     assert.equal(again.claimed, false, '已完结的一次性任务不得被重新认领');
+    db2.close();
+  } finally { cleanup(home); }
+});
+
+/**
+ * **本 bug 的真钉子**（生产现场走的就是这一条）：`/new` 的动作顺序是「先 start 新会话
+ * （同一 `tui_pid` 上 `upsertPresence` 覆盖）、**后** end 旧会话」。
+ *
+ * 只按 pid 删的 `SessionEnd` 于是把新会话刚写好的那一行一起抹掉——凡走过 `/new` 的窗口都
+ * 登记不上（`peers`/`whoami`/`claim`/`post` 全部报"本窗口未在 presence 中登记"），而 `/new`
+ * 是换会话、清上下文都会走的最日常路径。判据必须是"那一行还是我的吗"。
+ *
+ * 断言里带上 watcher 登记与 `whoami`：前者的丢失是同一处删除的另一种后果（新会话刚武装的
+ * watcher 登记随行一起消失 ⇒ 窗口被判成"从未武装"），后者是这件事对用户的可见形态。
+ */
+test('R-E5：/new 交错（start(new) 后 end(old)）不许抹掉新会话的 presence 行', () => {
+  const home = makeTmpHome();
+  try {
+    seedWindow(home, {
+      pid: ME_PID, sessionId: 'session_old', sessionTitle: '旧', cwd: CWD, handle: HANDLE,
+    });
+    assert.equal(runHook(event('SessionStart', { session_title: 'T' }), { home, tuiPid: ME_PID }).status, 0,
+      '新会话登记失败，这条用例的前置就不成立');
+
+    // 新会话已经武装了 watcher：那一行若被旧会话迟到的 end 删掉，这次武装也一起消失
+    const db0 = dbOf(home);
+    identity.setWatcher(db0, { tuiPid: ME_PID, watcherPid: 555, watcherUntil: Date.now() + 3_600_000 });
+    db0.close();
+
+    const r = runHook({ hook_event_name: 'SessionEnd', session_id: 'session_old', cwd: CWD },
+      { home, tuiPid: ME_PID });
+    assert.equal(r.status, 0, r.stderr);
+
+    const db = dbOf(home);
+    const rows = db.prepare('SELECT * FROM presence').all();
+    db.close();
+    assert.equal(rows.length, 1, `旧会话迟到的 end 删掉了新会话的登记: ${JSON.stringify(rows)}`);
+    assert.equal(rows[0].session_id, SESSION, '留下的必须是新会话');
+    assert.equal(rows[0].handle, HANDLE, 'handle 也不该被那次 end 影响');
+    assert.equal(rows[0].watcher_pid, 555, '新会话刚武装的 watcher 登记同样不该被抹掉');
+
+    // 用户可见的后果：登记没了，本窗口所有命令都解不出身份
+    const w = runCli(['whoami', '--json', '--tui-pid', String(ME_PID)],
+      { home, procRoot: procRootOf(home) });
+    assert.equal(w.status, 0, `whoami 应仍能认出本窗口: ${w.stderr.trim()}`);
+    assert.equal(JSON.parse(w.stdout).sessionId, SESSION);
+  } finally { cleanup(home); }
+});
+
+/**
+ * `session_id` 缺失/为空时**跳过删除**。此时无法判断那一行是不是自己的，而删错的那一行
+ * **没人能补回来**——窗口不会因为别人删了它的登记就重跑 `SessionStart`。宁可留一行陈旧登记
+ * （`reapDead` 或下一个 `SessionStart` 会收敛），也不要动别人的行。
+ *
+ * 跳过必须在审计里看得见：这类"我什么都没做"的分支正是上一轮整轮潜伏的那种形态。
+ */
+test('R-E5：SessionEnd 载荷缺 session_id 或为空时跳过删除，并留一行审计', () => {
+  const home = makeTmpHome();
+  try {
+    // 这一行属于**正在使用中**的会话：正是"删错就没人补得回来"的那一行
+    seedMe(home);
+    for (const payload of [
+      { hook_event_name: 'SessionEnd', cwd: CWD },                    // 键整个缺席
+      { hook_event_name: 'SessionEnd', session_id: '', cwd: CWD },    // 空串
+    ]) {
+      const r = runHook(payload, { home, tuiPid: ME_PID });
+      assert.equal(r.status, 0, r.stderr);
+      const db = dbOf(home);
+      const left = db.prepare('SELECT session_id FROM presence').all().map(x => x.session_id);
+      db.close();
+      assert.deepEqual(left, [SESSION],
+        `缺/空 session_id 时必须跳过删除（${JSON.stringify(payload)}）`);
+    }
+
+    const entries = JSON.parse(runCli(['log', '--json', '--home', home],
+      { home, procRoot: procRootOf(home) }).stdout);
+    const hits = entries.filter(e => e.action === 'session-end-missing-session');
+    assert.equal(hits.length, 2, `每次跳过都要留痕，实际 ${JSON.stringify(entries.map(e => e.action))}`);
+    assert.match(hits[0].detail, new RegExp(String(ME_PID)), '明细要点出是哪个 pid 上的行被留下了');
+    assert.match(hits[0].detail, new RegExp(SESSION), '并要说清留在库里的是哪一行（可现场自查）');
+  } finally { cleanup(home); }
+});
+
+/**
+ * 同一个删除的更一般形态：载荷带着 session_id，但那不是当前登记在案的会话（慢 hook、
+ * 迟到的 end、`/new` 之后才到的旧 end）。此时删掉当前行同样是"把别人的行当成自己的"。
+ */
+test('R-E5：SessionEnd 的 session_id 与当前那一行不符时不动那一行', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const r = runHook({ hook_event_name: 'SessionEnd', session_id: 'session_old', cwd: CWD },
+      { home, tuiPid: ME_PID });
+    assert.equal(r.status, 0, r.stderr);
+
+    const db = dbOf(home);
+    assert.deepEqual(db.prepare('SELECT session_id FROM presence').all().map(x => x.session_id), [SESSION],
+      'sid 不符 ⇒ 那一行不是我的 ⇒ 一个字都不许动');
+    db.close();
+
+    // 回归：载 sid 与那一行一致时，正常退出**必须**照旧删掉（别把这条修成"永远不删"）
+    assert.equal(runHook(event('SessionEnd'), { home, tuiPid: ME_PID }).status, 0);
+    const db2 = dbOf(home);
+    assert.equal(db2.prepare('SELECT COUNT(*) AS c FROM presence').get().c, 0, '自己退出时仍要回收自己那一行');
     db2.close();
   } finally { cleanup(home); }
 });

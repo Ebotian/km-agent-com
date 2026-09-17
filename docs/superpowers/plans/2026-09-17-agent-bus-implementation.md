@@ -1076,8 +1076,9 @@ git commit -m "feat: posts.mjs 发帖/增量读/游标/订阅；修正 spec 谓�
   - `cmdlineRole(cmdline: string): 'kimi-code' | 'bus-watch' | null`
   - `pidEntryExists(pid: number, procRoot?): boolean`
   - `findKimiAncestor(startPid: number, procRoot?, maxDepth = 16): number | null`
-  - `upsertPresence(db, {tuiPid, sessionId, sessionTitle, cwd, handle}): void`
-  - `removePresence(db, {tuiPid}): void`
+  - `upsertPresence(db, {tuiPid, sessionId, sessionTitle, cwd, handle}): void` —— 按 `tui_pid` 覆盖（含清 watcher 登记）；**但同一 `session_id` 再登记时保留 `watcher_pid`/`watcher_until`**（R-E6，见本任务尾注）
+  - `removePresence(db, {tuiPid, sessionId}): number` —— 只删**本会话自己**那一行（`sessionId` 必填：`presence` 以 `tui_pid` 为主键，而 `/new` 会把同一 pid 上的 `session_id` 换掉，按 pid 删就会删掉后来者的行）；删不到时返回 0
+  - `reapPresence(db, {tuiPid}): number` —— "这个 pid 已经不是活窗口了"那条路径（`reapDead` 用的就是它）；**只有这里按 pid 删是对的**
   - `setWatcher(db, {tuiPid, watcherPid, watcherUntil}): void`
   - `clearWatcher(db, {tuiPid}): void`
   - `listPresence(db, {now = Date.now(), procRoot?}): Array<Presence>`，`Presence = {tuiPid, sessionId, sessionTitle, cwd, handle, alive: boolean, deaf: 'never' | 'dead' | 'expired' | null}` —— `now` 有默认值（省略时用当前时间；否则 `watcher_until <= undefined` 恒假，会把过期租约**静默报成不聋**）
@@ -1435,13 +1436,27 @@ export function upsertPresence(db, { tuiPid, sessionId, sessionTitle, cwd, handl
       session_title = excluded.session_title,
       cwd           = excluded.cwd,
       handle        = excluded.handle,
-      watcher_pid   = NULL,
-      watcher_until = NULL
+      -- 后续修正（R-E6）：只有**会话真的换了**才清 watcher 登记。同一 session_id 再登记一次
+      -- （source=resume 恢复同一会话）时旧 watcher 很可能还在跑，清了会让窗口被判"从未武装"。
+      -- DO UPDATE 里 `presence.` 指旧行、`excluded.` 指新行；一条语句 ⇒ 没有先查再写的间隙，
+      -- 也不需要事务（registerPresence 已经在 BEGIN IMMEDIATE 里）。
+      watcher_pid   = CASE WHEN presence.session_id = excluded.session_id
+                           THEN presence.watcher_pid ELSE NULL END,
+      watcher_until = CASE WHEN presence.session_id = excluded.session_id
+                           THEN presence.watcher_until ELSE NULL END
   `).run({ tuiPid, sessionId, sessionTitle: sessionTitle ?? null, cwd, handle });
 }
 
-export function removePresence(db, { tuiPid }) {
-  db.prepare('DELETE FROM presence WHERE tui_pid = ?').run(tuiPid);
+// 后续修正（R-E5）：删除必须限定到自己的会话。只按 tui_pid 删会把同一窗口后来者（/new 之后的
+// 新会话）刚写好的行一起抹掉；"这个 pid 已经不是活窗口"是另一条语义，收进 reapPresence
+// （reapDead 用它），免得两条判据共用一个入口、再被误用一次。
+export function removePresence(db, { tuiPid, sessionId }) {
+  if (!sessionId) throw new Error('removePresence 需要 sessionId：只按 tui_pid 删会删掉同一窗口后来者的行');
+  return db.prepare('DELETE FROM presence WHERE tui_pid = ? AND session_id = ?').run(tuiPid, sessionId).changes;
+}
+
+export function reapPresence(db, { tuiPid }) {
+  return db.prepare('DELETE FROM presence WHERE tui_pid = ?').run(tuiPid).changes;
 }
 
 export function setWatcher(db, { tuiPid, watcherPid, watcherUntil }) {
@@ -1534,6 +1549,8 @@ git commit -m "feat: identity.mjs 祖先遍历/存活判定/presence 与 watcher
 > - **R-G1**：存活判定不只看 `/proc/<pid>` 目录是否存在，而是 `pidEntryExists(pid) && cmdlineRole(readCmdline(pid)) === <role>`（`pidHasRole`）——`listPresence.alive` 与 `reapDead` 用 `'kimi-code'`，`deafState` 判"watcher 已死"用 `'bus-watch'`。这是 spec §8.1 的 `alive := 进程存在 且 cmdline 是 kimi-code` 与 §8.3 的"判死活仍用同一套检查，只是校验 `bus.mjs watch`"的落地；不这样做，一个被回收后分配给别的进程的 pid 会被误判成活窗口，而 `cmdlineRole` 的 `'bus-watch'` 分支会变成死代码。僵尸进程的 `/proc` 目录仍在但 `cmdline` 为空 ⇒ `cmdlineRole` 返回 `null` ⇒ 判为不活。
 > - **R-I1（handle 稳定性）**：`handleFromCwd` 新增 `excludeTuiPid`——它**不能把自己那一行算成占位**，否则同一窗口每次 `/new` 都会换 handle（`agent-com` → `agent-com-2` → 又变回 `agent-com`），而 `@handle` 寻址依赖 handle 稳定。新增的 `registerPresence` 把"算 handle + 写 presence"收进一个 `BEGIN IMMEDIATE` 事务：读-写分离时两个同 basename 目录的窗口会在同一 hook 时延内读到同一快照、拿到**同一个 handle**（实测 8 个并发窗口有 5 行撞名），事务化后 8 行互不相同。`presence.handle` 没有 UNIQUE 约束，这条只能靠事务守。`listPresence` 的 `now` 默认 `Date.now()`，避免省略时把过期租约报成"不聋"。
 > - **下游调用方注意（Task 10）**：SessionStart hook 必须用 `registerPresence`（而不是 `handleFromCwd` + `upsertPresence` 两步），否则 R-I1 的事务保护不会生效。
+> - **R-E5（删除的判据）**：`removePresence` 必须带 `sessionId`（`WHERE tui_pid = ? AND session_id = ?`）。`/new` 的动作顺序是「先 start 新会话、后 end 旧会话」，只按 pid 删会把新会话刚写好的行抹掉 ⇒ 凡走过 `/new` 的窗口都登记不上（生产现场：`presence` 0 行、`subs` 2 行）。按 pid 判死活的 SIGKILL 回收是另一条语义，收进 `reapPresence`，`reapDead` 用它。
+> - **R-E6（watcher 登记的判据，与 R-E5 同一句话）**：`upsertPresence` 只在**会话真的换了**时才清 `watcher_pid`/`watcher_until`；`session_id` 没变（`source=resume` 恢复同一会话）就保留。无条件清掉会让窗口被判成"从未武装"，自愈逻辑再武装一个 ⇒ 同一窗口两个 watcher 抢同一条消息（每次命中都是整上下文重读）。保留永远安全：watcher 真死了 `deafState` 判 `'dead'`，自愈照常重新武装。实现是一条 SQL 的 `CASE`（无读写间隙、不碰 `registerPresence` 已有的 `BEGIN IMMEDIATE`）。
 
 ---
 
@@ -2665,7 +2682,7 @@ git commit -m "feat: bus watch 子命令（自注册/去抖轮询/strong 才退�
     | `hook_event_name` | 用到的载荷字段 | 行为 | 退出码 |
     |---|---|---|---|
     | `SessionStart` | `session_id`, `cwd`, `session_title` | 登记 presence + 种下默认订阅 | 0 |
-    | `SessionEnd` | `session_id` | 删除 presence 行、回收本会话**未完结**的租约（`claims.releaseAllForSession`；已完成的行留下，否则已完成的一次性任务会重新可被认领） | 0 |
+    | `SessionEnd` | `session_id` | 删除**本会话自己**那一行 presence（`tui_pid` + `session_id`；载荷缺 `session_id` 则跳过删除并留一行审计）、回收本会话**未完结**的租约（`claims.releaseAllForSession`；已完成的行留下，否则已完成的一次性任务会重新可被认领）；**不**动 `subs` / `read_cursor`（会话可能被 resume，删了会丢已读位置） | 0 |
     | `PreToolUse` | `session_id`, `cwd`, `tool_name`, `tool_input` | 检查待触碰路径是否被他人占用；冲突则 exit 2 | 0 或 2 |
     | `UserPromptSubmit` | `session_id`, `cwd` | stdout 输出 digest + 聋窗口自愈提示 | 0 |
 
@@ -2732,7 +2749,7 @@ test('SessionStart 登记 presence 并种下默认订阅', () => {
   } finally { cleanup(home); }
 });
 
-test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登记', () => {
+test('SessionStart 重复触发不产生重复 presence，且保留同一会话的 watcher 登记', () => {
   const home = emptyHome();
   try {
     sessionStart(home);
@@ -2742,7 +2759,9 @@ test('SessionStart 重复触发不产生重复 presence，且重置 watcher 登�
     sessionStart(home);
     const db2 = openDb(join(home, 'agent-bus', 'bus.db'));
     assert.equal(db2.prepare('SELECT COUNT(*) AS c FROM presence').get().c, 1);
-    assert.equal(db2.prepare('SELECT watcher_pid FROM presence WHERE tui_pid = 100').get().watcher_pid, null);
+    // 后续修正（R-E6）：同一会话再登记不许清 watcher（旧行为是清成 NULL —— 那会让窗口被判
+    // "从未武装"、自愈逻辑再武装一个）。"换了会话才清"由另一条用例钉住。
+    assert.equal(db2.prepare('SELECT watcher_pid FROM presence WHERE tui_pid = 100').get().watcher_pid, 999);
     db2.close();
   } finally { cleanup(home); }
 });
@@ -2989,10 +3008,17 @@ async function main() {
     const tuiPid = selfTuiPid(procRoot);
     const db = openDb(dbPath);
     const sid = payload.session_id || '';
-    if (tuiPid != null) identity.removePresence(db, { tuiPid });
+    // 后续修正（R-E5）：删除必须限定到自己的会话。`/new` 的顺序是「先 start 新会话、后 end
+    // 旧会话」，按 pid 删会把新会话刚写好的行一起抹掉 ⇒ 凡走过 /new 的窗口都登记不上。
+    // 载荷缺 session_id 时跳过删除并留审计（宁可留陈旧行，也不删别人的行）。
+    if (tuiPid != null && sid) identity.removePresence(db, { tuiPid, sessionId: sid });
     claims.releaseAllForSession(db, { holderSession: sid });
     claims.syncMarker(db, { kimiHome: home, now });
-    appendLog(home, { actor: sid || '?', action: 'session-end', detail: String(tuiPid) });
+    appendLog(home, {
+      actor: sid || '?',
+      action: tuiPid != null && !sid ? 'session-end-missing-session' : 'session-end',
+      detail: String(tuiPid),
+    });
     return 0;
   }
 
