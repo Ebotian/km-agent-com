@@ -35,6 +35,19 @@ test('PreToolUse 的 command 带 claims.marker 零成本预检', () => {
   assert.match(h.matcher, /Write|Edit|Bash/);
 });
 
+/**
+ * I2：预检读的 home 必须与 CLI/hook 内部分辨 home 的方式一致（`KIMI_CODE_HOME` 优先、
+ * 否则 `~/.kimi-code`）。原来只有 `$KIMI_CODE_HOME` 一支：环境里一旦没有这个变量，预检
+ * **恒假** ⇒ 每次工具调用直接 `exit 0` ⇒ L0 全灭，而 claim 照常落在 `~/.kimi-code/agent-bus/`
+ * ——一个完全静默的失效（e2e 的 precheckGate 把这个前提两边都钉住）。
+ */
+test('PreToolUse 的预检在 KIMI_CODE_HOME 缺席时回退到 $HOME/.kimi-code', () => {
+  const h = manifest.hooks.find(x => x.event === 'PreToolUse');
+  assert.match(h.command, /\$\{KIMI_CODE_HOME:-\$HOME\/\.kimi-code\}/,
+    '缺了这条回退，环境里没有 KIMI_CODE_HOME 时预检恒假（L0 静默全灭）');
+  assert.match(h.command, /^\s*\[ -f /);
+});
+
 test('manifest 引用的路径全部存在且在插件根内', () => {
   for (const rel of [manifest.skills, manifest.commands]) {
     assert.ok(rel.startsWith('./'), `${rel} 必须以 ./ 开头`);

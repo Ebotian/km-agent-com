@@ -48,7 +48,28 @@ test('digestBlock 列出点名项并给出取正文的命令', () => {
   assert.match(out, /#142/);
   assert.match(out, /bus\.mjs read 142/);
   assert.match(out, /1 条需要你处理/);
-  assert.match(out, /另有 1 条/);
+  // I4：弱投递的**标题必须真的到达接收方**。以前这里只报"另有 1 条"，而游标照样被推过
+  // ——那三条广播的标题从未进过上下文，也再没有机会进来。
+  assert.match(out, /#143/);
+  assert.match(out, /FYI/);
+  assert.match(out, /1 条来自你订阅的主题/);
+});
+
+test('digestBlock 投出弱投递的标题（I4：内容到达，不是只计数）', () => {
+  const out = r.digestBlock({
+    strong: [], weak: [p({ seq: 9, toSession: null, title: '广播标题X' })],
+    total: 1, reader: 'me', pluginRoot: '/plug',
+  });
+  assert.match(out, /广播标题X/, '弱帖的标题必须出现在接收方看到的文本里');
+  assert.match(out, /read 9/);
+});
+
+test('digestBlock 对超上限被截掉的弱投递明说还剩多少', () => {
+  const out = r.digestBlock({
+    strong: [p()], weak: [p({ seq: 143, toSession: null, title: 'FYI' })],
+    weakHidden: 7, total: 9, reader: 'me', pluginRoot: '/plug',
+  });
+  assert.match(out, /另有 7 条未列出/);
 });
 
 test('digestBlock 提示重新武装 watcher 时能带上原因', () => {
@@ -91,7 +112,8 @@ test('digestBlock 只有弱投递时不报「0 条需要你处理」', () => {
     total: 1, reader: 'me', pluginRoot: '/plug',
   });
   assert.equal(out.includes('0 条需要你处理'), false);
-  assert.match(out, /另有 1 条/);
+  assert.match(out, /1 条来自你订阅的主题/);
+  assert.match(out, /FYI/);
 });
 
 test('sanitize 先中和控制字符，标签无法被重组出来', () => {

@@ -10,7 +10,7 @@
     {
       "event": "PreToolUse",
       "matcher": "Write|Edit|Bash",
-      "command": "[ -f \"$KIMI_CODE_HOME/agent-bus/claims.marker\" ] || exit 0\nexec node \"$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs\"",
+      "command": "[ -f \"${KIMI_CODE_HOME:-$HOME/.kimi-code}/agent-bus/claims.marker\" ] || exit 0\nexec node \"$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs\"",
       "timeout": 5
     },
     {

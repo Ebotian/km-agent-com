@@ -138,6 +138,7 @@ test('--max-wait 到点仍未命中则退出 3 且清理登记', async () => {
     assert.equal(presenceRow(home).watcher_pid, w.child.pid, '退出前必须先登记上');
     const code = await waitExit(w.child);
     assert.equal(code, 3, w.stderr);
+    assert.match(w.stdout, /本轮无消息/, 'M5：任何终态都别留空 stdout（空 stdout = 一次没有内容的唤醒）');
     assert.equal(presenceRow(home).watcher_pid, null);
   } finally { cleanup(home); }
 });
@@ -260,4 +261,76 @@ test('R-Q3：--timeout 上界与安全整数守卫在写库之前拒绝', async 
       assert.equal(await waitExit(w.child), 3, w.stderr);
     } finally { cleanup(home); }
   } finally { cleanup(home); }
+});
+
+// —— M5 / M7：终态的 stdout 与"聋"的三种原因 ——
+
+/**
+ * M5：引擎对后台任务的**任何**终态都发完成通知并开新轮，而一次唤醒的固定成本是整个
+ * 上下文重读（实测 113k token）。stdout 为空时那次唤醒什么都不带——每个武装窗口每 12h
+ * 一次空唤醒，`watch off` 再来一次。所以非命中退出也要有**可判别**的一行。
+ *
+ * 代价是契约从"空 stdout = 到期"改成"最后一行能否 parse 成带 strong 的对象"，所以两条
+ * 用例都要在：命中 ⇒ 最后一行是 JSON；到期/信号 ⇒ 是一行说明、且不带 JSON。
+ */
+test('M5：到期退出时 stdout 有可判别的说明，不是空', async () => {
+  const { home, procRoot } = seedHome();
+  const w = startWatch(home, procRoot, ['--timeout', '1']);
+  try {
+    assert.equal(await waitExit(w.child, 8000), 0, w.stderr);
+    assert.notEqual(w.stdout.trim(), '', '空 stdout 会被引擎当成一次没有内容的完成通知');
+    assert.match(w.stdout, /到期/);
+    assert.match(w.stdout, /重新武装/);
+    assert.equal(w.stdout.includes('"strong"'), false, '这不是命中，不该出现 JSON 行');
+  } finally { w.child.kill('SIGKILL'); cleanup(home); }
+});
+
+test('M5：信号退出也有话说，且能一眼与"到期"区分', async () => {
+  const { home, procRoot } = seedHome();
+  const w = startWatch(home, procRoot);
+  try {
+    await sleep(250);
+    w.child.kill('SIGTERM');
+    assert.equal(await waitExit(w.child), 0, w.stderr);
+    assert.match(w.stdout, /信号/);
+    assert.match(w.stdout, /本轮无消息/);
+  } finally { cleanup(home); }
+});
+
+/**
+ * M7：`'expired'`（超时退出）以前实际不可达——干净超时的 watcher 先 `clearWatcher`，两个
+ * 字段一起清掉，于是被报成 `'never'`（"从未武装"）。文案把"时间到了该重新武装"说成
+ * "你从来没武装过"，运维方向完全不同（前者是时间到，后者是 skill 没照做）。
+ */
+test('M7：干净超时退出后状态是「超时退出」，不是「从未武装」', async () => {
+  const { home, procRoot } = seedHome();
+  const w = startWatch(home, procRoot, ['--timeout', '1']);
+  try {
+    assert.equal(await waitExit(w.child, 8000), 0, w.stderr);
+    const row = presenceRow(home);
+    assert.equal(row.watcher_pid, null, 'watcher_pid 该清');
+    assert.ok(row.watcher_until != null && row.watcher_until <= Date.now(),
+      `超时退出必须保留过期的 watcher_until，实际 ${JSON.stringify(row)}`);
+
+    const who = JSON.parse(runCli(['whoami', '--session', 'me', '--json', '--home', home], { home, procRoot }).stdout);
+    assert.equal(who.deaf, 'expired');
+    const peers = JSON.parse(runCli(['peers', '--session', 'me', '--json', '--home', home], { home, procRoot }).stdout);
+    const me = peers.peers.find(p => p.sessionId === 'me');
+    assert.equal(me.deaf, 'expired', 'peers 里也要能看出是哪种聋（而不是含糊的 never）');
+    assert.equal(me.deaf === 'never', false);
+  } finally { w.child.kill('SIGKILL'); cleanup(home); }
+});
+
+test('M5：--json 模式下非命中退出同样是单行 JSON，且不带 strong', async () => {
+  const { home, procRoot } = seedHome();
+  const w = startWatch(home, procRoot, ['--timeout', '1', '--json']);
+  try {
+    assert.equal(await waitExit(w.child, 8000), 0, w.stderr);
+    const lines = w.stdout.trim().split('\n');
+    assert.equal(lines.length, 1, `--json 下 stdout 必须只有一行，实际 ${lines.length} 行`);
+    const payload = JSON.parse(lines[0]);
+    assert.equal('strong' in payload, false, '没有命中就不该有 strong，否则调用方会读成一次唤醒');
+    assert.equal(payload.reason, 'timeout');
+    assert.match(payload.message, /本轮无消息/);
+  } finally { w.child.kill('SIGKILL'); cleanup(home); }
 });

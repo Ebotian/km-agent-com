@@ -173,3 +173,52 @@ test('getPost/poll/search/listTopics 的出口都是普通对象', () => {
     }
   });
 });
+
+// —— I4：弱投递的条数上限不能吞消息 ——
+
+/**
+ * I4：弱投递以前只报"另有 N 条"、**同时**把游标推过它们，于是那几条的标题永远进不了上下文。
+ * 现在弱帖出 triage 行，但有条数上限（`WEAK_MAX`）；被上限截掉的部分**绝不能推进游标**，
+ * 否则同一个缺陷换一种写法又回来了。
+ */
+test('poll：弱投递被上限截掉时不推进游标，下一轮继续投', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    for (let i = 1; i <= posts.WEAK_MAX + 2; i++) seed(db, { title: `w${i}` });
+    const r = posts.poll(db, { reader: 'me' });
+    assert.equal(r.weak.length, posts.WEAK_MAX);
+    assert.equal(r.weakHidden, 2);
+    assert.equal(r.nextCursor, posts.WEAK_MAX + 2, '整批的末尾仍是 nextCursor');
+    assert.equal(r.ackUpTo, posts.WEAK_MAX, '游标只该推到确实投出去的最后一条');
+    posts.ack(db, { reader: 'me', seq: r.ackUpTo });
+    const r2 = posts.poll(db, { reader: 'me' });
+    assert.deepEqual(r2.weak.map(p => p.title), [`w${posts.WEAK_MAX + 1}`, `w${posts.WEAK_MAX + 2}`],
+      '被截掉的那几条必须能在下一轮投出去');
+  });
+});
+
+test('poll：整批都投出去时 ackUpTo 就是最后一条', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    seed(db, { title: 'a' });
+    seed(db, { title: 'b', toSession: 'me' });
+    seed(db, { title: 'c' });
+    const r = posts.poll(db, { reader: 'me' });
+    assert.equal(r.weakHidden, 0);
+    assert.equal(r.ackUpTo, r.nextCursor);
+    posts.ack(db, { reader: 'me', seq: r.ackUpTo });
+    assert.equal(posts.poll(db, { reader: 'me' }).total, 0);
+  });
+});
+
+test('poll：点名帖永远不被上限截掉（它必须在同一轮里被投出去）', () => {
+  withDb(db => {
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    for (let i = 1; i <= posts.WEAK_MAX + 3; i++) seed(db, { title: `w${i}` });
+    seed(db, { title: 'direct', toSession: 'me' });
+    const r = posts.poll(db, { reader: 'me' });
+    assert.deepEqual(r.strong.map(p => p.title), ['direct']);
+    assert.equal(r.weakHidden, 3);
+    assert.equal(r.ackUpTo, posts.WEAK_MAX, '被截掉的是弱帖；游标不越过它们');
+  });
+});

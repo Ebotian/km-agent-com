@@ -1,9 +1,10 @@
 #!/usr/bin/env node
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { readFileSync, watch } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
 import { ALL_TOPIC, normalizeTopic } from '../lib/topic.mjs';
+import { nodeVersionError } from '../lib/version.mjs';
 import * as identity from '../lib/identity.mjs';
 import * as claims from '../lib/claims.mjs';
 import * as posts from '../lib/posts.mjs';
@@ -30,13 +31,14 @@ const USAGE = `用法: node bin/bus.mjs <命令> [参数] [--json] [--home <dir>
   peers                        列出活跃窗口（含聋状态）
   topics                       列出已有主题
   post --topic T --kind K --title S [--body B] [--to <handle|session>] [--reply-to N] [--origin human|agent]
-  read <seq> [--full] [--peek]
-  digest [--peek]              投递未读（默认推进游标）
+  read <seq> [--full] [--ack]  读一条；**默认不推进游标**，要推进就显式 --ack
+  digest [--peek]              投递未读（默认推进游标，只推到"确实投出去了"的那一条）
   search <文本>
   subscribe <pattern> | unsubscribe <pattern> | subs
   claim <resource> [--ttl 30m] [--note S]   认领文件/端口/任务（默认 30m，单位 ms/s/m/h；
-                                >0 且 ≤8760h）；被占退出 2
-  busy <resource>              查占用；被占退出 2
+                                >0 且 ≤8760h）；被占退出 2。路径类资源按 cwd 归一化，
+                                task:/port: 这类命名空间前缀原样保留
+  busy <resource>              查占用；被占退出 2（资源参数与 claim 同一套归一化）
   release <resource>           释放自己的租约
   done <postSeq> [--result S]  完结 task:<seq>，--result 附带一条 finding
   tasks                        列出未认领且未完成的 request
@@ -47,9 +49,11 @@ const USAGE = `用法: node bin/bus.mjs <命令> [参数] [--json] [--home <dir>
                                强投递才退出 0（一批 @ 合并成一次退出），弱投递只累计。
                                租约到期或收到 SIGTERM/SIGINT 也退出 0；--interval 默认
                                200（惊群去抖），--timeout 默认 43200 秒、上限 86400
-                               （引擎的后台任务上限）。**命中时 stdout 必有 JSON 行；
-                               到期或信号退出时 stdout 为空**——调用方据此区分两者。
-                               --max-wait 仅供测试：等够该毫秒数仍无命中则退出 3
+                               （引擎的后台任务上限）。**命中时 stdout 的最后一行是带 strong
+                               的 JSON；到期/信号退出时是一行说明（--json 下仍是单行 JSON，
+                               但不带 strong）**——判据是最后一行能否 parse 成带 strong 的
+                               对象，不是"stdout 是否为空"（后者会让每次到期都变成一次空
+                               唤醒）。--max-wait 仅供测试：等够该毫秒数仍无命中则退出 3
 `;
 
 function parseArgs(argv) {
@@ -59,7 +63,7 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a.startsWith('--')) {
       const key = a.slice(2);
-      if (key === 'json' || key === 'full' || key === 'peek') { flags[key] = true; continue; }
+      if (key === 'json' || key === 'full' || key === 'peek' || key === 'ack') { flags[key] = true; continue; }
       const val = argv[++i];
       if (val === undefined) throw new Error(`flag --${key} 缺少值`);
       flags[key] = val;
@@ -106,11 +110,22 @@ function ctx(flags, positional) {
   const procRoot = flags['proc-root'] || process.env.AGENT_BUS_PROC_ROOT || identity.DEFAULT_PROC_ROOT;
   const now = parseNow(flags.now);
   const db = openDb(join(home, 'agent-bus', 'bus.db'));
-  // spec §10：presence 的清扫不另设定时器，由任何一次 bus 命令顺带完成。
-  // 清扫是搭车性质，失败只提示，绝不能让主命令失败。
-  try { identity.reapDead(db, { procRoot }); } catch (err) {
-    process.stderr.write(`警告: 清扫 presence 失败: ${err.message}\n`);
-  }
+  // 搭车清扫：失败只提示，绝不能让主命令失败（spec §10：不另设定时器，由任何一次 bus
+  // 命令顺带完成——被 SIGKILL 的窗口不会有 SessionEnd，这些行必须有人回收）。
+  const sweep = (what, fn) => {
+    try { return fn(); } catch (err) {
+      process.stderr.write(`警告: ${what} 失败: ${err.message}\n`);
+      return undefined;
+    }
+  };
+  sweep('清扫 presence', () => identity.reapDead(db, { procRoot }));
+  // `claims` 是**唯一可变**的表，却一直没有上限回收：过期租约永远留在库里，而每条过期行
+  // 都还会在 `busy`/`peers`/`tasks` 里出现。回收放在公共路径上，与 presence 的清扫同理。
+  sweep('回收过期租约', () => claims.reapExpired(db, { now }));
+  // 同一趟把 marker 摆正（I2）：**它是 L0 的零成本预检**，缺了 marker 就没人启动 hook ⇒
+  // L0 全灭且无痕；而陈旧 marker 会让此后每个窗口的每次 Write/Edit/Bash 都白付一次
+  // node 冷启动 + 开库。两个方向都由这一行修好，且它搭在任何命令的公共路径上。
+  sweep('同步 claims.marker', () => claims.syncMarker(db, { kimiHome: home, now }));
   return { home, procRoot, now, db, flags, positional };
 }
 
@@ -162,6 +177,20 @@ function resolveTarget(c, to) {
 
 function out(c, human, obj) {
   process.stdout.write(c.flags.json ? JSON.stringify(obj) + '\n' : human);
+}
+
+/**
+ * 资源名的归一化（I1）。`lib/claims.mjs` 的 `conflicts` 是**精确字符串比较**，所以
+ * 「`bus claim lib/db.mjs` 存了相对串、`PreToolUse` 拿着 `/p/agent-com/lib/db.mjs` 去比」
+ * 这种不匹配就是一次静默放行。两边都用同一个基准（本窗口的 cwd）`path.resolve`。
+ *
+ * **命名空间前缀原样保留**：`task:1` / `port:8080` 不是路径，`resolve` 会把它们变成
+ * `/p/x/task:1`，于是 `done <seq>`（它自己拼 `task:<seq>`）与 `tasks` 的 JOIN 全部错位。
+ * 判据是"有没有 scheme 形状的 `前缀:`"，而不是"含不含斜杠"——后者会漏掉 `task:`。
+ */
+function normalizeResource(resource, cwd) {
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(resource)) return resource;
+  return cwd ? resolve(cwd, resource) : resource;
 }
 
 function cmdWhoami(c) {
@@ -221,6 +250,15 @@ function cmdPost(c) {
   out(c, `已发布 #${seq} 到 ${topic}\n`, { seq, topic, kind, to: toSession });
 }
 
+/**
+ * I3：`read` **默认不推进游标**，`--ack` 才推进。
+ *
+ * `posts.ack` 是单调不倒退的，所以"读到第 6 条"会把游标一口气推过 4、5——而
+ * `render.triageLine` 恰恰教 agent 去 `read <最新 seq>`（triage 行里给的就是各条的 seq，
+ * 但 agent 也可能从别处拿到一个大 seq）。两者一重合，中间的未读就永久不再投递：还在库里，
+ * 投递路径却看不见了。读一条不是"把之前的一切都读完"，所以默认无副作用。
+ * `--peek` 保留为兼容别名（现在它就是默认行为）。
+ */
 function cmdRead(c) {
   const me = resolveSelf(c);
   const seq = Number(c.positional[0]);
@@ -228,7 +266,7 @@ function cmdRead(c) {
   const post = posts.getPost(c.db, { seq });
   if (!post) throw new Error(`没有 #${seq}`);
   out(c, render.postMarkdown(post, { full: Boolean(c.flags.full) }), { post });
-  if (!c.flags.peek) posts.ack(c.db, { reader: me.sessionId, seq });
+  if (c.flags.ack) posts.ack(c.db, { reader: me.sessionId, seq });
 }
 
 function cmdDigest(c) {
@@ -238,10 +276,12 @@ function cmdDigest(c) {
     .find(p => p.sessionId === me.sessionId);
   const pluginRoot = process.env.KIMI_PLUGIN_ROOT || '.';
   const block = render.digestBlock({
-    strong: r.strong, weak: r.weak, total: r.total,
+    strong: r.strong, weak: r.weak, weakHidden: r.weakHidden, total: r.total,
     reader: me.sessionId, pluginRoot, deaf: peer?.deaf ?? null,
   });
-  if (!c.flags.peek && r.total > 0) posts.ack(c.db, { reader: me.sessionId, seq: r.nextCursor });
+  // 推到 `ackUpTo` 而不是 `nextCursor`：弱投递被单轮上限截掉的那几条还没投出去，
+  // 推过它们就是"计数报了、内容永远不到"那个缺陷的另一种写法。
+  if (!c.flags.peek && r.total > 0) posts.ack(c.db, { reader: me.sessionId, seq: r.ackUpTo });
   out(c, block ? block + '\n' : '', { ...r, block });
 }
 
@@ -316,13 +356,26 @@ function holderLabel(c, holder) {
 
 function cmdClaim(c) {
   const me = resolveSelf(c);
-  const resource = c.positional[0];
-  if (!resource) throw new Error('claim 需要 <resource>');
+  const raw = c.positional[0];
+  if (!raw) throw new Error('claim 需要 <resource>');
+  const resource = normalizeResource(raw, me.cwd);
+  // 先把参数验完再动盘：被拒的命令不该留下 marker（那只会让下一次工具调用白起一个 node）
+  const ttlMs = parseTtl(c.flags.ttl);
+  // I2：**marker 必须在 INSERT 之前就落盘**。两步之间被 SIGKILL/写盘失败，就会落在
+  // 「租约已在库里、marker 不在」——而 CLI 报的是 exit 1「领取失败」，用户以为没拿到资源，
+  // 此后 L0 对这个资源静默失效（预检恒假 ⇒ hook 根本不启动）。反过来（marker 在、租约还没
+  // 写）是安全方向：预检为真只让 hook 起来查一次库，查不到冲突照样放行。
+  // 这里**只创建、永不删除**：删除只在 syncMarker 里做，且必须先拿到写锁（见 lib/claims.mjs）。
+  claims.touchMarker(c.home, c.now);
   const r = claims.claim(c.db, {
-    resource, holderSession: me.sessionId, ttlMs: parseTtl(c.flags.ttl),
+    resource, holderSession: me.sessionId, ttlMs,
     note: c.flags.note ?? null, now: c.now,
   });
-  claims.syncMarker(c.db, { kimiHome: c.home, now: c.now });
+  // 认领成功后再补一次：本次 INSERT 提交之前，另一个进程的 `syncMarker` 可能恰好拿到写锁、
+  // 看不到这条尚未提交的租约、于是**删掉** marker（它的删除在事务内，所以一定发生在本
+  // INSERT 能提交之前）。那一步之后只有这一次写盘能把 marker 找回来——缺了它，"先 marker
+  // 后 INSERT"只挡住"进程被杀"，挡不住这条并发路径。
+  if (r.claimed) claims.touchMarker(c.home, c.now);
   appendLog(c.home, { actor: me.sessionId, action: r.claimed ? 'claim' : 'claim-failed', detail: resource });
   if (!r.claimed) {
     const line = `已被 ${holderLabel(c, r.holder)} 占用，${leaseLabel(r.leaseUntil)}\n`;
@@ -336,22 +389,26 @@ function cmdClaim(c) {
 }
 
 function cmdBusy(c) {
-  resolveSelf(c);
-  const resource = c.positional[0];
-  if (!resource) throw new Error('busy 需要 <resource>');
+  const me = resolveSelf(c);
+  const raw = c.positional[0];
+  if (!raw) throw new Error('busy 需要 <resource>');
+  // 与 claim 同一套归一化：否则 `busy lib/db.mjs` 查的是一个从未有人认领过的字符串，
+  // 而它报的是"空闲"——查了个寂寞。skill 里"动敏感资源前先 busy 查一次"全靠这一步。
+  const resource = normalizeResource(raw, me.cwd);
   const r = claims.busy(c.db, { resource, now: c.now });
   const holderHandle = r.holder ? holderLabel(c, r.holder) : null;
   // handle 由 topicFromCwd 规范化而来（只含字母/数字/._-），进上下文是安全的。
   out(c, r.held
     ? `被 ${holderHandle} 占用，${leaseLabel(r.leaseUntil)}\n`
-    : '空闲\n', { ...r, holderHandle });
+    : '空闲\n', { ...r, holderHandle, resource });
   if (r.held) process.exitCode = 2;
 }
 
 function cmdRelease(c) {
   const me = resolveSelf(c);
-  const resource = c.positional[0];
-  if (!resource) throw new Error('release 需要 <resource>');
+  const raw = c.positional[0];
+  if (!raw) throw new Error('release 需要 <resource>');
+  const resource = normalizeResource(raw, me.cwd);
   const r = claims.release(c.db, { resource, holderSession: me.sessionId });
   claims.syncMarker(c.db, { kimiHome: c.home, now: c.now });
   appendLog(c.home, { actor: me.sessionId, action: 'release', detail: resource });
@@ -436,8 +493,16 @@ function cmdPrune(c) {
   const topics = posts.listTopics(c.db).map(t => t.topic);
   let deleted = 0;
   for (const topic of topics) deleted += posts.pruneTopic(c.db, { topic, keep });
+  // `PRAGMA wal_checkpoint(TRUNCATE)` **有返回行** `{busy, log, checkpointed}`：用 exec 调它
+  // 等于把结果丢掉，于是"并发 busy 时 checkpoint 没做成"这件事无从知晓——而注释里写的
+  // "要说出来"只能靠这一行实现。busy=1 表示有别的连接正占着 WAL，页没交还，此时 TRUNCATE
+  // 不会抛错，只会静默什么都不做。`keep < 1` 由 `posts.pruneTopic` 自己挡（那里能拦到
+  // 直接调库的调用方，而 `positiveInt` 只管 CLI）。
   try {
-    c.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const row = c.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get();
+    if (row && row.busy !== 0) {
+      process.stderr.write(`警告: wal_checkpoint 未完成（busy=${row.busy}，有别的连接在用 WAL），WAL 未回收\n`);
+    }
   } catch (err) {
     process.stderr.write(`警告: wal_checkpoint 失败（归档已生效，WAL 未回收）: ${err.message}\n`);
   }
@@ -458,10 +523,30 @@ function emitWatchResult(c, me, r) {
     return;
   }
   const block = render.digestBlock({
-    strong: r.strong, weak: r.weak, total: r.total,
+    strong: r.strong, weak: r.weak, weakHidden: r.weakHidden, total: r.total,
     reader: me.sessionId, pluginRoot: process.env.KIMI_PLUGIN_ROOT || '.',
   });
   process.stdout.write((block ? block + '\n' : '') + JSON.stringify(payload) + '\n');
+}
+
+/**
+ * M5：**到期/信号退出不能留空 stdout。**
+ *
+ * 引擎对后台任务的**任何**终态都发完成通知，并据此开一个新轮次——而一次唤醒的固定成本是
+ * 整个上下文重读（实测约 113k token，spec §3.3）。stdout 为空时，那个被唤醒的 agent
+ * 拿到的是一份没有任何信息的通知：每个武装窗口每 12h 一次空唤醒，`/agent-bus:watch off`
+ * 再来一次。给一行**可判别**的说明，至少让这次唤醒带来"watcher 到期了、该重新武装"。
+ *
+ * 代价是 stdout 契约从"空 = 到期"改成"最后一行能否 parse 成带 strong 的对象"——两者都
+ * 是 exit 0，所以判据只能落在输出形状上（README / SKILL 已同步）。
+ */
+function watchExitNote(reason, pluginRoot) {
+  const why = {
+    timeout: 'watcher 到期（租约用完）',
+    signal: 'watcher 被信号停掉',
+    'max-wait': 'watcher 因 --max-wait 到点退出',
+  }[reason] ?? `watcher 退出（${reason}）`;
+  return `${why}，本轮无消息。重新武装: node ${pluginRoot}/bin/bus.mjs watch --timeout 43200`;
 }
 
 /**
@@ -538,14 +623,29 @@ async function cmdWatch(c) {
 
   const finish = (code, reason) => {
     try {
-      // 按 watcherPid 精确清除：别清掉同一窗口后来者的登记
-      identity.clearWatcher(c.db, { tuiPid: me.tuiPid, watcherPid: process.pid });
+      // 按 watcherPid 精确清除：别清掉同一窗口后来者的登记。
+      // M7：**干净超时只清 watcher_pid，留着已经过期的 watcher_until**——两者都清掉的话
+      // `deafState` 会报成 `'never'`（"从未武装"），把"时间到了该重新武装"说成"你从来没
+      // 武装过"，而 `'expired'` 这个状态实际不可达。信号退出是被撤下（或窗口结束），
+      // 两个字段都清才符合语义。
+      identity.clearWatcher(c.db, {
+        tuiPid: me.tuiPid, watcherPid: process.pid, keepUntil: reason === 'timeout',
+      });
       claims.syncMarker(c.db, { kimiHome: c.home, now: Date.now() });
       appendLog(c.home, { actor: me.sessionId, action: 'watch-stop', detail: `${code} ${reason}` });
     } catch { /* fail-open：清理失败不能改写退出码 */ }
     if (poke) { try { poke.close(); } catch { /* 已经关了 */ } }
     process.removeListener('SIGTERM', onSignal);
     process.removeListener('SIGINT', onSignal);
+    // M5：非命中退出也必须有话说（否则引擎那次完成通知是一次纯空唤醒）。
+    // `--json` 时同样保持"单行 JSON"的约定，但**不带 `strong`**——判据是"最后一行能否
+    // parse 成带 strong 的对象"，两种形态下都成立。
+    if (reason !== 'hit') {
+      const note = watchExitNote(reason, process.env.KIMI_PLUGIN_ROOT || '.');
+      process.stdout.write(c.flags.json
+        ? JSON.stringify({ watchedBy: process.pid, reason, message: note }) + '\n'
+        : note + '\n');
+    }
     // 用 exitCode 而非 process.exit()：stdout 上的 JSON 行还压在管道缓冲里（见入口注释）
     process.exitCode = code;
   };
@@ -608,7 +708,13 @@ if (!name || name === '--help' || !COMMANDS[name]) {
     // 与 onStdoutError 同一条规矩：不覆盖已置的非零退出码
     if (!process.exitCode) process.exitCode = 1;
   };
-  try {
+  // I5：入口的版本探测（`lib/db.mjs` 里还有一道同源的兜底，那是**强制点**——老 node 上
+  // `import 'node:sqlite'` 的失败发生在链接期，任何 CLI 侧的自查都来不及跑）。这里多说
+  // 一句是因为用户最可能在这条路径上第一次踩到它：CLI 每条命令都崩，却只看到
+  // `No such built-in module: node:sqlite`。
+  const nodeErr = nodeVersionError();
+  if (nodeErr) fail(new Error(nodeErr));
+  else try {
     const { flags, positional } = parseArgs(process.argv.slice(3));
     const done = COMMANDS[name](ctx(flags, positional));
     // watch 是 async：它里面的同步 throw 会变成 rejection，退出码的记账必须照样走到

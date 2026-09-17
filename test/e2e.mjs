@@ -350,6 +350,34 @@ function precheckGate() {
   assert(mismatched.status === 0, '预检读错 home 时必然放行');
   assert(!existsSync(shim.log), '预检读错 home 时 node 从未被启动——L0 在这种情形下是静默失效的');
 
+  // (f) I2：KIMI_CODE_HOME **缺席**（空）时必须回退到 `$HOME/.kimi-code`。环境里没有这个
+  // 变量是常见形态（引擎只往 hook 进程里注入它），而 CLI 侧的 `identity.kimiHome()` 是
+  // "KIMI_CODE_HOME 优先、否则 ~/.kimi-code"——预检没有同一条回退就恒假：每次工具调用直接
+  // exit 0，而 claim 照常落在 ~/.kimi-code/agent-bus/，全程无信号。
+  // 这里必须造出 `$HOME` 与 `$HOME/.kimi-code` 的真关系：默认 home 是 `~/.kimi-code` 本身，
+  // 所以单独用一个"$HOME = 临时目录"的窗口对，marker 落在 `<HOME>/.kimi-code/agent-bus/`。
+  const dh = newHome('precheck-defhome');
+  const dhKimi = join(dh.home, '.kimi-code');
+  seedWindowProc(dh, A.pid);
+  seedWindowProc(dh, B.pid);
+  hook('SessionStart', { session_id: A.session, cwd: A.cwd, session_title: 'A' }, { ...dh, home: dhKimi, tuiPid: A.pid });
+  hook('SessionStart', { session_id: B.session, cwd: B.cwd, session_title: 'B' }, { ...dh, home: dhKimi, tuiPid: B.pid });
+  cli(['claim', `${A.cwd}/data.db`, '--ttl', '1h', '--tui-pid', String(A.pid)], { ...dh, home: dhKimi });
+  assert(existsSync(join(dhKimi, 'agent-bus', 'claims.marker')), `默认 home 下的 marker 该在 ${dhKimi}`);
+
+  const viaHomeEnv = { home: dh.home, procRoot: dh.procRoot, input: payload };
+  const noHomeVar = runShell(PRECHECK, { ...viaHomeEnv, extraEnv: { KIMI_CODE_HOME: '' } });
+  assert(noHomeVar.status === 2,
+    `KIMI_CODE_HOME 缺席时应由 $HOME 回退找到 marker 并拦下调用，实际退出 ${noHomeVar.status}`);
+  assert(noHomeVar.stderr.includes(A.session), '回退之后拦下时同样要带上持有者');
+  rmSync(shim.log, { force: true });
+  runShell(PRECHECK, {
+    ...viaHomeEnv,
+    extraEnv: { KIMI_CODE_HOME: '', PATH: `${shim.dir}:${process.env.PATH}`, SHIM_LOG: shim.log },
+  });
+  assert(existsSync(shim.log) && /bus-hook\.mjs/.test(readFileSync(shim.log, 'utf8')),
+    'KIMI_CODE_HOME 缺席时也必须进入 exec node 分支（预检不是恒假）');
+
   // (e) 释放 ⇒ marker 消失 ⇒ 预检重新为假：门是活的，跟着租约生命周期开关
   cli(['release', `${A.cwd}/data.db`, '--tui-pid', String(A.pid)], h);
   assert(!existsSync(marker), '释放后不该再有 claims.marker');
@@ -357,6 +385,7 @@ function precheckGate() {
 
   console.log('✓ 预检门：claim ⇒ marker 出现 ⇒ 那一行进入 exec node 分支并拦住调用；release ⇒ marker 消失');
   console.log('✓ 阴性对照：KIMI_CODE_HOME 与 marker 所在 home 不一致时预检恒假（L0 静默失效）');
+  console.log('✓ KIMI_CODE_HOME 缺席时回退到 $HOME/.kimi-code，预检仍然为真');
 }
 
 main()

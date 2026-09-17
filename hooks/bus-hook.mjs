@@ -4,7 +4,7 @@
 // 这四件事里只有 PreToolUse 保证**正确性**：它挂在访问点上，别人占了你要碰的资源就
 // 拒绝这次调用（"做不成"），比任何"通知"（"被告知别做"）都强。其余三个都是尽力而为的
 // 副作用与投递，所以整个流程 fail-open——总线一挂绝不能卡死所有窗口的工具调用。
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
 import { topicFromCwd } from '../lib/topic.mjs';
 import * as identity from '../lib/identity.mjs';
@@ -68,16 +68,64 @@ function selfTuiPid(procRoot) {
   return identity.findKimiAncestor(process.ppid, procRoot);
 }
 
-/** 从 PreToolUse 载荷里抠出本次要触碰的绝对路径；抠不出来就返回 []（放行） */
+/** 从 PreToolUse 载荷里抠出本次要触碰的路径；抠不出来就返回 []（放行） */
 function touchedPaths(payload) {
   const ti = payload.tool_input ?? {};
+  const cwd = typeof payload.cwd === 'string' && payload.cwd ? payload.cwd : null;
   const out = new Set();
+  // **`path` 是主键，`file_path` / `file_paths` 只为兼容旧载荷保留。**
+  // C1：引擎发的就是 `path`——`WriteInputSchema` / `EditInputSchema` 的入参名（见
+  // packages/agent-core-v2/.../write.ts、edit.ts），而 `runPreToolUse` 把工具调用
+  // 的 args **原样**塞进 `tool_input`。只认 `file_path` 等于：文档里的真实键一律放行，
+  // `Write` / `Edit` 这两个最主要的写入工具上，L0 是**静默关闭**的。
+  if (typeof ti.path === 'string') out.add(ti.path);
   if (typeof ti.file_path === 'string') out.add(ti.file_path);
   if (Array.isArray(ti.file_paths)) for (const p of ti.file_paths) if (typeof p === 'string') out.add(p);
   if (typeof ti.command === 'string') {
-    for (const m of ti.command.matchAll(/(?:^|[\s'"=])(\/[^\s'"|;&<>()]+)/g)) out.add(m[1]);
+    // 启发式（对 Bash 只有启发式可言，见 README「L0 是唯一的硬约束」）：按 shell 分隔符
+    // 切词，取出"看起来像路径"的词——绝对路径、`./`/`../` 开头、以及含 `/` 的词（`lib/db.mjs`
+    // 这种相对路径以前整个漏掉）。`2>>` / `>` / `<` 这类重定向前后没有空白，所以再单独扫一遍
+    // 重定向目标：紧跟 `>`/`>>`/`<` 的词必是路径（`2>&1` 这种 fd 复制要排除）。
+    for (const tok of ti.command.split(/[\s'"|;&()<>`=]+/)) addCommandPath(out, tok);
+    for (const m of ti.command.matchAll(/(?<![<>])(?:>>?|<)\s*([^\s'"|;&<>()]+)/g)) addCommandPath(out, m[1]);
   }
-  return [...out].filter(p => p.startsWith('/') && !p.startsWith('/dev/') && !p.startsWith('/proc/'));
+  const resolved = [];
+  for (const raw of out) {
+    const abs = resolveAgainst(raw, cwd);
+    if (abs) resolved.push(abs);
+  }
+  return [...new Set(resolved)].filter(p => !p.startsWith('/dev/') && !p.startsWith('/proc/'));
+}
+
+/** 命令里"看起来像路径"的词：选项（`-rf`）、URL、fd 复制（`&1`）都不是路径 */
+function addCommandPath(out, tok) {
+  if (!tok || tok.startsWith('-') || tok.startsWith('&')) return;
+  if (tok.includes('://')) return;                       // URL，不是本机路径
+  if (tok.startsWith('/') || tok.startsWith('./') || tok.startsWith('../')) { out.add(tok); return; }
+  if (tok.includes('/')) out.add(tok);                   // 相对路径：`lib/db.mjs`
+}
+
+/**
+ * 路径归一化（I1）。认领侧（`bus claim|busy|release`）也做同一件事，两边必须用同一个
+ * 基准，而 `lib/claims.mjs` 的 `conflicts` 是**精确字符串比较**——所以归一化只能发生在
+ * 传进去之前：`/p/x/./y`、`/p//x/y`、相对路径本来是三种写法、三个不同的字符串。
+ *
+ * 没有 `cwd` 时**不猜**：拿 hook 自己的 cwd（插件根）去补相对路径会得到一条永远不会
+ * 撞上的路径，那是"看起来拦了、其实没拦"。
+ */
+function resolveAgainst(p, cwd) {
+  try {
+    if (p.startsWith('/')) return resolve(p);
+    if (!cwd) return null;
+    return resolve(cwd, p);
+  } catch { return null; }
+}
+
+/** 审计明细是有界的：tool_input 里可能有 64KB 正文 */
+function boundedJson(value, max = 200) {
+  let s;
+  try { s = JSON.stringify(value ?? null); } catch { return '(不可序列化)'; }
+  return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
 
 function sessionStart(db, { payload, sid, tuiPid, cwd, home, procRoot }) {
@@ -151,17 +199,18 @@ function preToolUse(db, { paths, sid, now }) {
   return decision;
 }
 
-function userPromptSubmit(db, { sid, now, procRoot }) {
+function userPromptSubmit(db, { sid, now, procRoot, home, pluginRoot }) {
   const r = posts.poll(db, { reader: sid });
   const peer = identity.listPresence(db, { now, procRoot }).find(p => p.sessionId === sid);
   // R4：`deaf === null` 是"在听"这个哨兵，只能用三元兜底——`?? 'never'` 只在 null/undefined
   // 上兜底，会把健康窗口误报成"从未武装"。
   const block = render.digestBlock({
-    strong: r.strong, weak: r.weak, total: r.total,
+    strong: r.strong, weak: r.weak, weakHidden: r.weakHidden, total: r.total,
     reader: sid, pluginRoot, deaf: peer ? peer.deaf : 'never',
   });
-  // 投了就推进游标：同一条消息不该在每次用户说话时重复注入
-  if (r.total > 0) posts.ack(db, { reader: sid, seq: r.nextCursor });
+  // 投了就推进游标：同一条消息不该在每次用户说话时重复注入。推到 `ackUpTo` 而不是
+  // `nextCursor`——弱投递超过单轮上限时被截掉的那几条还没投出去，推过它们等于永久丢失。
+  if (r.total > 0) posts.ack(db, { reader: sid, seq: r.ackUpTo });
   if (block) process.stdout.write(block + '\n');
   return 0;
 }
@@ -194,12 +243,24 @@ async function main() {
 
   if (event === 'PreToolUse') {
     const paths = touchedPaths(payload);
-    // 抠不出路径就连库都不开：这条路径挂在每次工具调用的关键路径上（node 冷启动 ~40ms）
-    if (paths.length === 0) return 0;
+    if (paths.length === 0) {
+      // **抠不出路径时不再是无痕的。** 以前这里是直接 return 0：连库都不开、不留任何日志，
+      // 于是"载荷的键名对不上"这类缺陷可以整轮潜伏——文档说 L0 在拦，实际每次调用都放行，
+      // 而现场什么都不剩。审计是旁路（写不出去也不该影响放行），成本只有一次 appendFile，
+      // 且只在"这次调用我们一点路径都没看懂"时发生。
+      try {
+        appendLog(home, {
+          actor: sid || '?', action: 'pretooluse-no-path',
+          detail: `${payload.tool_name ?? '?'} ${boundedJson(payload.tool_input)}`,
+        });
+      } catch { /* 审计写不出去也要放行 */ }
+      // 抠不出路径仍连库都不开：这条路径挂在每次工具调用的关键路径上（node 冷启动 ~40ms）
+      return 0;
+    }
     return preToolUse(openDb(dbPath), { paths, sid, now });
   }
 
-  return userPromptSubmit(openDb(dbPath), { sid, now, procRoot });
+  return userPromptSubmit(openDb(dbPath), { sid, now, procRoot, home, pluginRoot });
 }
 
 // R-S1：绝不用 `process.exit()`——stdout 就是注入进上下文的内容，exit 会丢掉尚未排空的

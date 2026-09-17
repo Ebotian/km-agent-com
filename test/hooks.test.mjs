@@ -7,7 +7,7 @@ import * as identity from '../lib/identity.mjs';
 import * as claims from '../lib/claims.mjs';
 import * as posts from '../lib/posts.mjs';
 import {
-  makeTmpHome, cleanup, procRootOf, seedWindow, seedProcEntry, runHook, runHookAsync,
+  makeTmpHome, cleanup, procRootOf, seedWindow, seedProcEntry, runCli, runHook, runHookAsync,
 } from './helpers.mjs';
 
 const SESSION = 'session_aaaa-bbbb';
@@ -434,5 +434,172 @@ test('R-T3：载荷送到但管道不关闭时仍能读到并做出判定（pty 
     8000, 'hook 在载荷已送达但管道不关闭时挂住了');
     assert.equal(r.status, 2, `送到的载荷没进 hook: ${r.stderr}`);
     assert.match(r.stderr, /other-session/);
+  } finally { cleanup(home); }
+});
+
+// —— C1：载荷键名（本轮 Critical）——
+
+/**
+ * C1：引擎发给 `PreToolUse` 的载荷里，`Write` / `Edit` 的入参名是 **`path`**，不是 `file_path`。
+ * 本轮独立复核拿到两处一手证据：
+ *
+ * 1. 引擎源码：`packages/agent-core-v2/src/agent/tools/os/write/write.ts` 里
+ *    `WriteInputSchema = z.object({ path: z.string()…, content: … })`，`.../edit/edit.ts` 的
+ *    `EditInputSchema` 同名；而 `agentExternalHooksService.ts` 的 `runPreToolUse` 把工具调用
+ *    的 `args` **原样**塞进载荷（`toolInput: isPlainRecord(ctx.args) ? ctx.args : {}`），
+ *    `matchHooks.toHookInputData` 只把**顶层**键名 camel→snake（`toolInput` → `tool_input`）。
+ * 2. 本机真实会话的 `wire.jsonl`：`Write` 调用的 args 键是 `["content","path"]`、`Edit` 是
+ *    `["new_string","old_string","path"]`；扫过 46 个 wire.jsonl、321 次 Edit、124 次 Write，
+ *    **没有一处** `file_path`（打包产物里那 15 处 `file_path` 全在 UI 的局部预览回退链里）。
+ *
+ * 只认 `file_path` 的后果：文档里写的那个键一律放行，`Write`/`Edit` 上 L0 **静默关闭**。
+ */
+test('C1：PreToolUse 用引擎真实载荷形状（tool_input.path）拦得住', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const resource = '/p/agent-com/lib/db.mjs';
+    const db = dbOf(home);
+    claims.claim(db, { resource, holderSession: 'other-session', ttlMs: 60_000, now: Date.now() });
+    db.close();
+
+    for (const tool of ['Write', 'Edit']) {
+      const r = runHook(event('PreToolUse', {
+        tool_name: tool, tool_input: { path: resource },
+      }), { home, tuiPid: ME_PID });
+      assert.equal(r.status, 2,
+        `${tool} 的 path 载荷必须拦下（这正是引擎发的形状），实际退出 ${r.status}；stderr=${r.stderr.trim()}`);
+      assert.match(r.stderr, /other-session/);
+    }
+  } finally { cleanup(home); }
+});
+
+test('C1：旧键 file_path / file_paths 仍被接受（只为兼容，不是主路径）', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const resource = '/p/agent-com/lib/db.mjs';
+    const db = dbOf(home);
+    claims.claim(db, { resource, holderSession: 'other-session', ttlMs: 60_000, now: Date.now() });
+    db.close();
+
+    assert.equal(runHook(event('PreToolUse', {
+      tool_name: 'Write', tool_input: { file_path: resource },
+    }), { home, tuiPid: ME_PID }).status, 2);
+    assert.equal(runHook(event('PreToolUse', {
+      tool_name: 'Write', tool_input: { file_paths: [resource] },
+    }), { home, tuiPid: ME_PID }).status, 2);
+  } finally { cleanup(home); }
+});
+
+/**
+ * C1 的另一半：抠不出路径时**必须留下审计**。以前这里是 `return 0` 且连库都不开——一次
+ * "我们一点都没看懂"的调用在现场什么都不剩，所以"载荷键名对不上"这类缺陷能整轮潜伏。
+ */
+test('C1：抠不出路径时留一行审计（不再无痕放行）', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const r = runHook(event('PreToolUse', {
+      tool_name: 'Bash', tool_input: { command: 'git status --short' },
+    }), { home, tuiPid: ME_PID });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, '');
+
+    const log = runCli(['log', '--json', '--session', SESSION, '--home', home], { home });
+    assert.equal(log.status, 0, log.stderr);
+    const entries = JSON.parse(log.stdout);
+    const hit = entries.find(e => e.action === 'pretooluse-no-path');
+    assert.ok(hit, `审计里应有 pretooluse-no-path，实际 ${JSON.stringify(entries.map(e => e.action))}`);
+    assert.equal(hit.actor, SESSION);
+    assert.match(hit.detail, /git status/, '明细要能看出这次调用长什么样');
+  } finally { cleanup(home); }
+});
+
+// —— I1：路径归一化（两侧都 resolve）——
+
+/**
+ * I1：`payload.cwd` 是引擎保证会给的公共字段，而 `lib/claims.mjs` 的 `conflicts` 是**精确
+ * 字符串比较**——所以相对路径、`./x`、`/p/x/./y`、`/p//x/y` 这些写法必须在**传入之前**归一化，
+ * 两侧用同一个基准（本窗口 cwd）。以前它们全部放行：文档承诺"L0 拦得住"，而实际只在
+ * "绝对路径、且写法完全一致"时才拦得住。
+ */
+test('I1：相对路径按 payload.cwd 归一化后仍然拦得住（Write / Edit / Bash）', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const db = dbOf(home);
+    claims.claim(db, {
+      resource: '/p/agent-com/lib/db.mjs', holderSession: 'other-session', ttlMs: 60_000, now: Date.now(),
+    });
+    db.close();
+
+    const cases = [
+      ['Write', { path: 'lib/db.mjs' }],
+      ['Edit', { path: './lib/db.mjs' }],
+      ['Write', { file_path: 'lib/db.mjs' }],
+      ['Bash', { command: 'sed -i s/a/b/ lib/db.mjs' }],
+      ['Bash', { command: 'echo x > lib/db.mjs' }],
+      ['Bash', { command: 'echo x >>lib/db.mjs' }],
+      ['Bash', { command: 'cat <lib/db.mjs' }],
+      ['Bash', { command: 'echo x 2>>/p/agent-com/lib/db.mjs' }],
+      ['Write', { path: '/p/agent-com/./lib/db.mjs' }],
+      ['Write', { path: '/p/agent-com//lib/db.mjs' }],
+    ];
+    for (const [tool, tool_input] of cases) {
+      const r = runHook(event('PreToolUse', { tool_name: tool, tool_input }), { home, tuiPid: ME_PID });
+      assert.equal(r.status, 2,
+        `${tool} ${JSON.stringify(tool_input)} 应被拦下，实际退出 ${r.status}`);
+    }
+  } finally { cleanup(home); }
+});
+
+test('I1：没有 cwd 时不猜相对路径（放行），绝对路径照旧拦得住', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const resource = '/p/agent-com/lib/db.mjs';
+    const db = dbOf(home);
+    claims.claim(db, { resource, holderSession: 'other-session', ttlMs: 60_000, now: Date.now() });
+    db.close();
+
+    const noCwd = { hook_event_name: 'PreToolUse', session_id: SESSION, tool_name: 'Write', tool_input: { path: 'lib/db.mjs' } };
+    assert.equal(runHook(noCwd, { home, tuiPid: ME_PID }).status, 0,
+      '没有 cwd 时宁可放行，也不能拿 hook 自己的 cwd 猜出一条永远不会撞上的路径');
+    assert.equal(runHook({ ...noCwd, cwd: CWD, tool_input: { path: resource } }, { home, tuiPid: ME_PID }).status, 2);
+  } finally { cleanup(home); }
+});
+
+// —— I4：弱投递的内容必须真的到达 ——
+
+/**
+ * I4：弱投递（订阅命中、非点名）以前只出一句"另有 N 条"，**同时**把游标推过它们——三条
+ * 广播的标题从未进过上下文，也再没有机会进来（游标已越过，永远排不出来）。L3 承诺的是
+ * "静默积压，等下次交互排空"，而"排空"的前提是内容真的投出去。
+ */
+test('I4：弱投递的标题确实到达接收方，且游标与投递一致', () => {
+  const home = makeTmpHome();
+  try {
+    // 必须真的订阅了主题：弱投递的全部来源就是"命中我订阅的前缀"
+    seedMe(home, { subscribes: [HANDLE] });
+    const db = dbOf(home);
+    for (const title of ['广播一', '广播二', '广播三']) {
+      posts.createPost(db, {
+        topic: HANDLE, authorSession: 'other', authorCwd: '/p/other',
+        origin: 'agent', kind: 'finding', title, now: Date.now(),
+      });
+    }
+    db.close();
+
+    const r = runHook(event('UserPromptSubmit'), { home, tuiPid: ME_PID });
+    assert.equal(r.status, 0, r.stderr);
+    for (const title of ['广播一', '广播二', '广播三']) {
+      assert.match(r.stdout, new RegExp(title), `弱帖「${title}」的标题必须进上下文`);
+    }
+    assert.match(r.stdout, /1 条|3 条/);
+
+    const db2 = dbOf(home);
+    assert.equal(posts.poll(db2, { reader: SESSION }).total, 0, '投出去之后游标才该推到位');
+    db2.close();
   } finally { cleanup(home); }
 });

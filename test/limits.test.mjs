@@ -184,3 +184,71 @@ test('R-T4：--now 与 --ttl 相加越界时在写库之前被拒，资源不被
     assert.match(held.stdout, /275760-09-13/, '边界上的租约要能正常渲染成 ISO 时间');
   } finally { cleanup(home); }
 });
+
+// —— pruneTopic 的 keep 下界（会破坏全局 seq 单调性的那一档）——
+
+/**
+ * `pruneTopic(db, {topic, keep: 0})` 会**清空该主题**，使全局 `MAX(seq)` 下降——之后新帖
+ * 重新拿到小 seq。而 `claims.resource = 'task:' || seq` 与 `read_cursor.last_seq` 都建立在
+ * "seq 单调"上：游标永久失明 + `task:*` 撞名，两者都**无法自愈**。CLI 侧有 `positiveInt`
+ * 挡着，但库层必须自己挡——`done --result`、hook 等路径也直接调库。
+ *
+ * `undefined` 是更隐蔽的一档：绑成 NULL 后 `LIMIT NULL` 在 SQLite 里等于"不限"，同样清空
+ * 整个主题。所以判据是"正整数"，不是"≥ 1"。
+ */
+test('pruneTopic 拒绝 keep < 1 与非法 keep，一行都不删', () => {
+  const { home } = seedHome();
+  try {
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    for (let i = 1; i <= 5; i++) posts.createPost(db, { ...base, title: `t${i}`, now: i });
+    const before = db.prepare('SELECT MAX(seq) AS m FROM posts').get().m;
+    assert.equal(before, 5);
+
+    for (const keep of [0, -1, 1.5, NaN, undefined, null, '3']) {
+      assert.throws(() => posts.pruneTopic(db, { topic: 'agent-com', keep }),
+        /keep/, `keep=${String(keep)} 必须被拒`);
+    }
+    assert.equal(db.prepare('SELECT COUNT(*) AS c FROM posts').get().c, 5, '被拒时一行都不许删');
+    assert.equal(db.prepare('SELECT MAX(seq) AS m FROM posts').get().m, before,
+      '全局 seq 的单调性是游标与 task: 命名的基础，不能被归档破坏');
+    // 合法值照常工作（守卫只挡非法值）
+    assert.equal(posts.pruneTopic(db, { topic: 'agent-com', keep: 1 }), 4);
+    db.close();
+  } finally { cleanup(home); }
+});
+
+/**
+ * M2：`PRAGMA wal_checkpoint(TRUNCATE)` 是有返回行的语句（`{busy, log, checkpointed}`），
+ * 用 `exec` 调它等于把结果丢掉：并发下有别的连接持着读快照时它**不抛错**，只静静地把
+ * `busy=1` 交回来，于是"WAL 没回收"这件事谁也不知道——而注释里写的是"要说出来"。
+ */
+test('M2：wal_checkpoint 未完成（busy=1）时要在 stderr 说出来', () => {
+  const { home, procRoot } = seedHome();
+  let reader = null;
+  try {
+    const dbPath = join(home, 'agent-bus', 'bus.db');
+    const db = openDb(dbPath);
+    for (let i = 1; i <= 5; i++) posts.createPost(db, { ...base, title: `t${i}`, now: i });
+    db.close();
+
+    // 另一个连接持着一个读快照：WAL 下它不阻塞写，但足以让 TRUNCATE 收不回 WAL
+    reader = openDb(dbPath);
+    reader.exec('BEGIN');
+    assert.ok(reader.prepare('SELECT COUNT(*) AS c FROM posts').get().c >= 5, '前置：读快照真的拿到了');
+
+    const r = runCli(['prune', '--keep', '1', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(r.status, 0, 'checkpoint 没做成不该让归档失败');
+    assert.match(r.stderr, /busy=1/, `要说清是并发挡住而不是别的失败，实际 stderr: ${r.stderr.trim()}`);
+    assert.match(r.stdout, /已归档 4 条/);
+
+    reader.exec('COMMIT');
+    reader.close();
+    reader = null;
+    const clean = runCli(['prune', '--keep', '1', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(clean.status, 0, clean.stderr);
+    assert.equal(clean.stderr.includes('busy=1'), false, '没有并发挡住时不该报警');
+  } finally {
+    if (reader) { try { reader.close(); } catch { /* 已经关了 */ } }
+    cleanup(home);
+  }
+});

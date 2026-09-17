@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDb } from '../lib/db.mjs';
-import { claim, release, busy, complete, conflicts, reapExpired, releaseAllForSession, syncMarker, markerPath } from '../lib/claims.mjs';
+import { claim, release, busy, complete, conflicts, reapExpired, releaseAllForSession, syncMarker, touchMarker, markerPath } from '../lib/claims.mjs';
 import { makeTmpHome, cleanup } from './helpers.mjs';
 
 function withDb(fn) {
@@ -147,5 +147,53 @@ test('releaseAllForSession 对没有租约的会话返回 0', () => {
     claim(db, { resource: '/p/a', holderSession: 'sA', ttlMs: 1000, now: 0 });
     assert.equal(releaseAllForSession(db, { holderSession: 'sZ' }), 0);
     assert.equal(rowOf(db, '/p/a').holder, 'sA');
+  });
+});
+
+// —— I2：marker 的两条写入路径（claim 只创建；删除必须先拿写锁）——
+
+test('I2：touchMarker 只创建，删除只归 syncMarker', () => {
+  withDb((db, home) => {
+    // touchMarker 的职责是"claim 之前先把 marker 摆好"：进程在 INSERT 与写盘之间被杀时，
+    // 只有它能让 marker 已经存在（L0 的预检就靠这个文件）
+    assert.equal(existsSync(markerPath(home)), false);
+    touchMarker(home, 5);
+    assert.equal(existsSync(markerPath(home)), true);
+    touchMarker(home, 6);
+    assert.equal(existsSync(markerPath(home)), true, '库里没有租约时它也照样只写不删');
+    assert.equal(syncMarker(db, { kimiHome: home, now: 7 }), false);
+    assert.equal(existsSync(markerPath(home)), false, '删除只发生在 syncMarker 里');
+  });
+});
+
+/**
+ * I2 的 TOCTOU 那一半：并发 claim 的中间态是「INSERT 已提交、marker 还没写」，而删除侧
+ * 若"先 SELECT 再 rm"就会删掉一条**活跃**租约的 marker。修法是删除必须发生在写锁之内：
+ * 拿不到写锁时它根本不能做决定，只能抛（由调用方 fail-open）。这里用第二个连接的
+ * BEGIN IMMEDIATE + 未提交 INSERT 精确造出那个中间态，不依赖时序运气。
+ */
+test('I2：写锁在别人手里时删除侧不删 marker（不赌"看不到就等于没有"）', () => {
+  withDb((db, home) => {
+    const mp = markerPath(home);
+    touchMarker(home, 0);
+    db.exec('PRAGMA busy_timeout = 20');   // 让"拿不到锁"当场可见，不必等 5s
+
+    const other = openDb(join(home, 'bus.db'));
+    try {
+      other.exec('BEGIN IMMEDIATE');
+      // 走 lib 自己的认领入口：这一行落在 other 的未提交事务里，正是并发 claim 的中间态
+      assert.equal(claim(other, {
+        resource: '/p/x', holderSession: 'sB', ttlMs: 60_000, now: Date.now(),
+      }).claimed, true);
+
+      assert.throws(() => syncMarker(db, { kimiHome: home, now: 0 }), /busy|locked/i,
+        '拿不到写锁时必须失败，而不是"看不到租约"就删');
+      assert.equal(existsSync(mp), true,
+        '误删一条活跃租约的 marker = L0 对那条资源静默失效（预检恒假，hook 根本不启动）');
+
+      other.exec('COMMIT');
+      assert.equal(syncMarker(db, { kimiHome: home, now: 0 }), true);
+      assert.equal(existsSync(mp), true, '提交之后这条租约必须被看见');
+    } finally { other.close(); }
   });
 });
