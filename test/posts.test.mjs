@@ -338,3 +338,61 @@ test('poll 拒绝负数/非整数的上限，但放行 0', () => {
     assert.ok(r.total > 0, 'total 要承诺"有东西可展示或有东西被藏起来"');
   });
 });
+
+/**
+ * 断言"带参数名地抛"——**并且不是裸的 `datatype mismatch`**。只断言 `assert.throws` 是不够的：
+ * 本轮的整个动机就是"错误消息里要能看出是哪个参数、哪个函数"，而裸的 SQLite 报错恰好也满足
+ * "抛了"。所以两条都钉上。
+ */
+function assertThrowsNamed(fn, name, label) {
+  assert.throws(fn, err => err instanceof Error
+    && err.message.includes(name)
+    && !/datatype mismatch/.test(err.message), label);
+}
+
+/**
+ * Important：`Number.isInteger` 管不到 int64 上界。`≥ 2^63 - 512` 的有限整数（在 double 里一律
+ * 舍成 `2^63`）能过上一版的守卫，之后 `strongLimit + 1` 溢出 int64 ⇒ SQLite 抛**裸的**
+ * `Error: datatype mismatch`（无参数名）——正是本轮的守卫要消灭的那类看不懂的错。
+ * **这不是回归**：改前这批值也是 `datatype mismatch`，是上一版守卫没收全。
+ *
+ * 边界取 `2^63 - 1024`（见 `lib/posts.mjs` 的 `MAX_LIMIT`）：[2^62, 2^63) 这一档的 ulp 是 1024，
+ * 它是该档最大的可表示值，也是 SQLite 能绑的最大档位——必须放行，否则守卫就对"改前可用的值"
+ * 额外收窄了。
+ */
+test('poll 拒绝 int64 上界之外的上限（不落到裸的 datatype mismatch）', () => {
+  withDb(db => {
+    for (const ok of [2 ** 53, 2 ** 63 - 1024]) {
+      assert.doesNotThrow(() => posts.poll(db, { reader: 'me', strongLimit: ok }),
+        `strongLimit=${ok} 在 SQLite 能绑的范围内，必须放行`);
+      assert.doesNotThrow(() => posts.poll(db, { reader: 'me', weakLimit: ok }),
+        `weakLimit=${ok} 在 SQLite 能绑的范围内，必须放行`);
+    }
+    // 越过 `2^63 - 1024` 的下一档：这些数在 JS 里**都等于 `2^63`**（`2^63 - 512` 起 ulp 变 2048）
+    for (const over of [2 ** 63 - 512, 2 ** 63 - 1, 2 ** 63, 2 ** 64, Number.MAX_VALUE]) {
+      assertThrowsNamed(() => posts.poll(db, { reader: 'me', strongLimit: over }), 'strongLimit',
+        `strongLimit=${over} 必须带参数名地拒掉`);
+      assertThrowsNamed(() => posts.poll(db, { reader: 'me', weakLimit: over }), 'weakLimit',
+        `weakLimit=${over} 必须带参数名地拒掉`);
+    }
+  });
+});
+
+/**
+ * 折进来的一条：同一个入口上的 `reader` 更糟。`undefined` 是裸
+ * `TypeError: Provided value cannot be bound to SQLite parameter 1.`（无参数名）；`null` 与 `''`
+ * 更坏——它们绑得进去、查询恒不命中，于是 `poll` **静默**返回 `strong=0 weak=0 total=0`，调用方
+ * 会把那个空数组读成"没有新消息"。**静默的空答案比抛错更坏**，正是本模块一直在消灭的那类失效。
+ */
+test('poll 拒绝非空字符串之外的 reader', () => {
+  withDb(db => {
+    for (const bad of [undefined, null, '']) {
+      assertThrowsNamed(() => posts.poll(db, { reader: bad }), 'reader',
+        `reader=${JSON.stringify(bad)} 必须带参数名地拒掉`);
+    }
+    // 合法值照常工作（守卫只挡非法值）
+    posts.subscribe(db, { reader: 'me', pattern: 'agent-com' });
+    seed(db, { title: 'w1' });
+    assert.equal(posts.poll(db, { reader: 'me' }).weak.length, 1);
+  });
+});
