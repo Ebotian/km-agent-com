@@ -22,17 +22,38 @@ const EVENTS = new Set(['SessionStart', 'SessionEnd', 'PreToolUse', 'UserPromptS
 
 const pluginRoot = process.env.KIMI_PLUGIN_ROOT || '.';
 
+/**
+ * 读 stdin 必须是**有界**的（R-T3）。契约形态下（引擎按 spec F10 pipe 进 JSON）'end'
+ * 在 20ms 内就到，这条上限不产生任何影响；但没有它，hook 自己就不保证不阻塞——引擎
+ * 不给 stdin 时只能靠引擎的 timeout=5 兜底，而 PreToolUse 挂在**每次工具调用**的关键
+ * 路径上。到点就用已读到的内容继续（读不到东西则 fail-open）。
+ *
+ * 这里曾经用过 `isTTY` 快路，**那是错的**：万一引擎改用 pty 投递，载荷会被静默丢掉，
+ * PreToolUse 于是对每次调用都拿到空载荷 ⇒ L0 全灭且没有任何信号。
+ */
+const STDIN_DEADLINE_MS = 2000;
+
 function readStdin() {
   return new Promise((resolve) => {
-    // 引擎按 spec F10 必然把载荷 pipe 进来。stdin 是 TTY 只说明载荷根本没来（比如 hook 被
-    // 手工拉起、或引擎把终端直接继承给了子进程）——那就别在这里等一个永远不会到的 EOF：
-    // PreToolUse 挂在每次工具调用的关键路径上，干等只会白等一次引擎的 hook timeout。
-    if (process.stdin.isTTY) { resolve(''); return; }
     let buf = '';
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(buf);
+    };
+    timer = setTimeout(() => {
+      // 光"不再等"还不够：stdin 还是开着的句柄，会把进程留在事件循环里 ⇒ "有界"只
+      // 体现在解析上、不体现在退出上。先关掉它再收工。
+      try { process.stdin.destroy(); } catch { /* 已经关了 */ }
+      finish();
+    }, STDIN_DEADLINE_MS);
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (d) => { buf += d; });
-    process.stdin.on('end', () => resolve(buf));
-    process.stdin.on('error', () => resolve(buf));
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
   });
 }
 
@@ -87,19 +108,49 @@ function sessionEnd(db, { sid, tuiPid, home, now }) {
   return 0;
 }
 
+/** `Date` 能表示的最大毫秒数；超过它的 `toISOString()` 会抛 `RangeError: Invalid time value`。 */
+const DATE_MAX_MS = 8.64e15;
+
+/**
+ * 租约期限的渲染**绝不能抛**（R-T1）。`lease_until` 落在 `(8.64e15, 9.007e15]` 时它仍是
+ * JS **安全整数**：SQL 侧比较照常（`conflicts` 会正常判出冲突），但 `new Date(lu)`
+ * `.toISOString()` 会抛。文案能不能拼出来，绝不能改变"拦不拦"这个判定。
+ */
+function leaseLabel(leaseUntil) {
+  return Number.isSafeInteger(leaseUntil) && Math.abs(leaseUntil) <= DATE_MAX_MS
+    ? new Date(leaseUntil).toISOString()
+    : `原值 ${leaseUntil}（超出 Date 表示范围）`;
+}
+
+/**
+ * R-T1：**先定决策，再拼文案。** 已判定的冲突必须原样返回 2——文案渲染（含 stderr 写入）
+ * 整个包在 try/catch 里，异常只影响文案；若让它冒泡到 `main()` 的 fail-open catch，
+ * 一次格式化失败就会把"拒绝这次工具调用"降级成"exit 0 + 已放行"，也就是 L0 对该资源
+ * 静默失效。
+ */
 function preToolUse(db, { paths, sid, now }) {
   if (paths.length === 0) return 0;
   const hits = claims.conflicts(db, { paths, session: sid, now });
   if (hits.length === 0) return 0;
-  // 文案进的是模型的上下文，所以两个插值都过 sanitize：resource 来自 `bus claim <resource>`
-  // 的自由文本，holder 是 session_id——控制字符/换行/伪造标签都不该从这里漏进上下文。
-  const lines = hits.map(h => `  ${render.sanitize(h.resource, 300)} —— 由 ${render.sanitize(h.holder)} 持有至 ${new Date(h.leaseUntil).toISOString()}`);
-  process.stderr.write(
-    `agent-bus: 以下资源已被其他窗口占用，本次操作被拒绝：\n${lines.join('\n')}\n` +
-    `请等对方释放，或先与它协商（node ${pluginRoot}/bin/bus.mjs peers）。\n`
-  );
+  const decision = 2;
+  try {
+    // 文案进的是模型的上下文，所以两个插值都过 sanitize：resource 来自 `bus claim <resource>`
+    // 的自由文本，holder 是 session_id——控制字符/换行/伪造标签都不该从这里漏进上下文。
+    const lines = hits.map(h =>
+      `  ${render.sanitize(h.resource, 300)} —— 由 ${render.sanitize(h.holder)} 持有至 ${leaseLabel(h.leaseUntil)}`);
+    process.stderr.write(
+      `agent-bus: 以下资源已被其他窗口占用，本次操作被拒绝：\n${lines.join('\n')}\n` +
+      `请等对方释放，或先与它协商（node ${pluginRoot}/bin/bus.mjs peers）。\n`
+    );
+  } catch {
+    // 兜底文案不再碰日期与 sanitize：只点出持有者，够操作者知道去找谁
+    try {
+      const holders = hits.map(h => String(h.holder)).join('、');
+      process.stderr.write(`agent-bus: 以下资源已被其他窗口占用，本次操作被拒绝（持有者: ${holders}）\n`);
+    } catch { /* 连兜底都写不出去，也照样拦 */ }
+  }
   // L0 的强制力就来自这个 2：工具被拒，说明进上下文
-  return 2;
+  return decision;
 }
 
 function userPromptSubmit(db, { sid, now, procRoot }) {

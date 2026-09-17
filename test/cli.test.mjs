@@ -497,3 +497,38 @@ test('非 EPIPE 的 stdout 写错误不覆盖已置的退出码，也不让失�
     assert.equal(ok.status, 1, '输出没送达就不能以 0 退出');
   } finally { closeSync(fd); cleanup(home); }
 });
+
+// —— R-T2：`--now` 的统一守卫（评审裁决；波及的是 L0 本身）——
+
+/**
+ * `--now` 没有上界时，`claim` 会把 lease_until 写成超出 JS 安全整数的 int64 并**落库**：
+ * SQLite 接受它，此后 `claims.conflicts` 一读就抛 `ERR_OUT_OF_RANGE` ⇒ `PreToolUse`
+ * 碰到这条路径只能 fail-open——**唯一保证正确性的机制对被污染的那条资源静默失效**。
+ * 守卫必须落在 `ctx()` 里、**任何写库之前**，而不是各个子命令里各写一遍。
+ */
+test('R-T2：--now 超出安全整数/日期范围时在写库之前被拒，资源不被污染', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    for (const bad of ['9999999999999999', '9007199254740993', '1e999', 'abc',
+      '8640000000000001', '-8640000000000001']) {
+      const r = runCli(['claim', '/p/y', '--now', bad, '--ttl', '30m', '--session', 'me',
+        '--home', home, '--proc-root', procRoot], { home, procRoot });
+      assert.equal(r.status, 1, `--now ${bad} 应被拒，实际 ${r.status}`);
+      assert.match(r.stderr, /now/, `--now ${bad} 的错误文案要能自查`);
+    }
+
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM claims').get().n, 0, '被拒不得留下任何租约行');
+    db.close();
+
+    // 守卫只该挡越界值：范围内的 --now（时钟注入）必须照旧可用
+    const t0 = 1_700_000_000_000;
+    const ok = runCli(['claim', '/p/y-ok', '--now', String(t0), '--ttl', '30m',
+      '--session', 'me', '--home', home, '--proc-root', procRoot], { home, procRoot });
+    assert.equal(ok.status, 0, ok.stderr);
+    const db2 = openDb(join(home, 'agent-bus', 'bus.db'));
+    assert.equal(db2.prepare('SELECT lease_until FROM claims WHERE resource = ?').get('/p/y-ok').lease_until,
+      t0 + 1_800_000, '合法 --now 仍必须被当作租约基准');
+    db2.close();
+  } finally { cleanup(home); }
+});

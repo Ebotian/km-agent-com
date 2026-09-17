@@ -351,3 +351,88 @@ test('数据库损坏时也 fail-open（并留下可自查的 stderr）', () => 
     assert.match(r.stderr, /已放行/, '失败必须留下痕迹，否则现场只剩"放行"');
   } finally { cleanup(home); }
 });
+
+// —— R-T1 / R-T3：评审裁决的三条加固 ——
+
+/** 给异步用例加一个会**真失败**的上限：挂住就是断言失败，而不是把整个测试文件拖死。 */
+function deadline(promise, ms, message) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      try { promise.child?.kill('SIGKILL'); } catch { /* 已经退了 */ }
+      reject(new Error(message));
+    }, ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * R-T1：**判定与文案解耦**。`lease_until` 落在 `(8.64e15, 9.007e15]` 时它仍是 JS 安全
+ * 整数——`claims.conflicts` 会正常判出冲突（`lease_until > now` 在 SQL 里是 int64 运算），
+ * 但 `new Date(lu).toISOString()` 抛 `RangeError: Invalid time value`。若格式化发生在
+ * 决策之前、或被 `main()` 的 fail-open catch 一并吞掉，**已判定的冲突会退化成
+ * "exit 0 + 已放行"**，也就是 L0 对这个资源静默失效。
+ *
+ * 可经 CLI 触达：`bus claim /p/x --now 9000000000000000 --ttl 30m`（租约行真的落库了）。
+ */
+test('R-T1：租约超出 Date 表示范围时仍然拦截（文案失败不许改判定）', () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const resource = '/p/agent-com/lib/db.mjs';
+    const db = dbOf(home);
+    claims.claim(db, { resource, holderSession: 'other-session', ttlMs: 60_000, now: 8.7e15 });
+    const lu = db.prepare('SELECT lease_until AS lu FROM claims WHERE resource = ?').get(resource).lu;
+    db.close();
+    // 前置：夹具必须真的落在"安全整数但超出 Date 表示范围"那个区间，否则这条用例什么都没测
+    assert.ok(Number.isSafeInteger(lu) && lu > 8.64e15, `夹具没造出目标区间: ${lu}`);
+
+    const r = runHook(event('PreToolUse', {
+      tool_name: 'Write', tool_input: { file_path: resource },
+    }), { home, tuiPid: ME_PID });
+    assert.equal(r.status, 2, `已判定的冲突被文案拖成了放行: ${r.stderr}`);
+    assert.match(r.stderr, /other-session/, '文案可以降级，但必须点出持有者');
+  } finally { cleanup(home); }
+});
+
+/**
+ * R-T3：stdin 有界读取。契约形态（引擎 pipe）下 20ms 内就 'end'，行为不变；但
+ * **hook 自己必须保证不阻塞**——引擎不给 stdin 时不能靠引擎的 timeout=5 兜底。
+ */
+test('R-T3：stdin 开了却永不送数据也不关闭时，不永远挂住（到点 fail-open）', async () => {
+  const home = makeTmpHome();
+  try {
+    const t0 = Date.now();
+    const r = await deadline(runHookAsync(event('PreToolUse', {
+      tool_name: 'Write', tool_input: { file_path: '/p/x' },
+    }), { home, tuiPid: ME_PID, writeStdin: false, closeStdin: false }),
+    6000, 'hook 在 stdin 不关闭时挂住了（有界读取没生效）');
+    const elapsed = Date.now() - t0;
+    assert.equal(r.status, 0, `空载荷应放行: ${r.stderr}`);
+    assert.ok(elapsed < 5000, `有界读取应在 2s 量级收工，实际 ${elapsed}ms`);
+  } finally { cleanup(home); }
+});
+
+/**
+ * R-T3 的另一半：万一引擎改用 pty 投递（载荷送到了，但管道/终端不关），必须**读到载荷**。
+ * 用 `isTTY` 快路会把整份载荷静默丢掉 ⇒ PreToolUse 对每次调用都拿到空载荷 ⇒ L0 全灭
+ * 且没有任何信号。这条用例钉住"送得到就读得到"。
+ */
+test('R-T3：载荷送到但管道不关闭时仍能读到并做出判定（pty 形态）', async () => {
+  const home = makeTmpHome();
+  try {
+    seedMe(home);
+    const db = dbOf(home);
+    claims.claim(db, {
+      resource: '/p/agent-com/data.db', holderSession: 'other-session', ttlMs: 60_000, now: Date.now(),
+    });
+    db.close();
+
+    const r = await deadline(runHookAsync(event('PreToolUse', {
+      tool_name: 'Bash', tool_input: { command: 'sqlite3 /p/agent-com/data.db "select 1"' },
+    }), { home, tuiPid: ME_PID, writeStdin: true, closeStdin: false }),
+    8000, 'hook 在载荷已送达但管道不关闭时挂住了');
+    assert.equal(r.status, 2, `送到的载荷没进 hook: ${r.stderr}`);
+    assert.match(r.stderr, /other-session/);
+  } finally { cleanup(home); }
+});

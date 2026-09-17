@@ -67,10 +67,30 @@ function parseArgs(argv) {
   return { flags, positional };
 }
 
+/**
+ * `--now` 的统一守卫（R-T2）。它被当租约基准算进 `lease_until`，所以越界的 `--now` 会
+ * 写出**超出 JS 安全整数**的 int64：SQLite 收得下，此后 `claims.conflicts` 一读就抛
+ * `ERR_OUT_OF_RANGE`，`PreToolUse` 对那条资源只能 fail-open ⇒ 唯一保证正确性的机制（L0）
+ * 静默失效，而操作者看到的只是"claim 失败"（或什么都没看到）。上界取 8.64e15，与 `log`
+ * 判坏时间戳的那条日期上界一致。
+ *
+ * 必须落在 `ctx()` 里、**任何写库之前**：各个子命令自己查会漏，而漏掉的那条就是漏洞。
+ */
+const DATE_MAX_MS = 8.64e15;
+
+function parseNow(raw) {
+  if (raw == null) return Date.now();
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || Math.abs(n) > DATE_MAX_MS) {
+    throw new Error(`--now 需要安全整数且 |now| ≤ 8.64e15（与日志的日期上界一致），收到 ${raw}`);
+  }
+  return n;
+}
+
 function ctx(flags, positional) {
   const home = flags.home || identity.kimiHome();
   const procRoot = flags['proc-root'] || process.env.AGENT_BUS_PROC_ROOT || identity.DEFAULT_PROC_ROOT;
-  const now = flags.now ? Number(flags.now) : Date.now();
+  const now = parseNow(flags.now);
   const db = openDb(join(home, 'agent-bus', 'bus.db'));
   // spec §10：presence 的清扫不另设定时器，由任何一次 bus 命令顺带完成。
   // 清扫是搭车性质，失败只提示，绝不能让主命令失败。

@@ -136,16 +136,28 @@ export function runHook(payload, opts = {}) {
 /**
  * 并发场景必须用它：`spawnSync` 会把 N 次调用**串行化**，`SessionStart` 之间那道
  * 读-写间隙就永远重现不出来（registerPresence 的整点意义）。
+ *
+ * `writeStdin`/`closeStdin` 两个开关模拟 stdin 的三种形态（R-T3）：
+ * - 默认（都 true）：契约形态，写完就关。
+ * - `writeStdin: false, closeStdin: false`：管道**开了但永不送数据也不关**——
+ *   钉"hook 自己不会永远挂住"（有界读取）。
+ * - `writeStdin: true, closeStdin: false`：载荷送到了但管道不关（万一引擎改用 pty
+ *   投递就是这种形态）——钉"载荷照样能读到"，而不是被 isTTY 快路静默丢掉。
  */
 export function runHookAsync(payload, opts = {}) {
-  const env = hookEnv(opts);
-  return new Promise((resolve) => {
-    const child = spawn(process.execPath, [HOOK], { env });
+  const { writeStdin = true, closeStdin = true } = opts;
+  const child = spawn(process.execPath, [HOOK], { env: hookEnv(opts) });
+  const done = new Promise((resolve) => {
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => { stdout += d; });
     child.stderr.on('data', (d) => { stderr += d; });
     child.on('close', (status) => resolve({ status, stdout, stderr }));
-    child.stdin.end(JSON.stringify(payload));
+    if (writeStdin) child.stdin.write(JSON.stringify(payload));
+    if (closeStdin) child.stdin.end();
   });
+  // 用例用 deadline 兜底时要能 kill 掉挂住的子进程：只 reject 不 kill 的话，那个进程
+  // 会把整份测试文件留在事件循环里（表现是"某条用例失败"变成"整个文件超时"）。
+  done.child = child;
+  return done;
 }
