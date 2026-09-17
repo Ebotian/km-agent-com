@@ -38,3 +38,19 @@ test('matches 前缀含子树，且不会把 ab 当成 a 的子树', () => {
 test('ALL_TOPIC 是 all', () => {
   assert.equal(ALL_TOPIC, 'all');
 });
+
+test('normalizeTopic 保留 Unicode 字母数字，CJK 不再归空', () => {
+  assert.equal(normalizeTopic('项目'), '项目');
+});
+
+test('topicFromCwd 保留 CJK 目录名，不再截断', () => {
+  assert.equal(topicFromCwd('/home/u/abc项目'), 'abc项目');
+});
+
+test('normalizeTopic 保留 slug 语义', () => {
+  assert.equal(normalizeTopic('my project'), 'my-project');
+});
+
+test('matches 用纯字符串比较：_ 不是单字符通配符', () => {
+  assert.equal(matches('a', 'a_b'), false);
+});
