@@ -157,6 +157,30 @@ test('post --to 支持 handle，解析不到时退出码 1 并列出候选', () 
   } finally { cleanup(home); }
 });
 
+test('post --to 命中重名 handle 时报歧义并列出候选，且不落库', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    // 模拟 Task 5 修 R-I1 之前可能留下的重名行：两个窗口共用 handle 'dup'。
+    // session_id 与 handle 都不等于 'dup'，所以解析只能落在 handle 这一支。
+    id.upsertPresence(db, { tuiPid: 300, sessionId: 'session_x1', sessionTitle: 'C', cwd: '/p/dup', handle: 'dup' });
+    id.upsertPresence(db, { tuiPid: 301, sessionId: 'session_x2', sessionTitle: 'D', cwd: '/p/dup2', handle: 'dup' });
+    db.close();
+
+    const r = runCli(['post', '--topic', 'agent-com', '--kind', 'request', '--title', 'x',
+      '--to', 'dup', '--session', 'me', '--home', home], { home, procRoot });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /歧义/);
+    assert.match(r.stderr, /session_x1/);
+    assert.match(r.stderr, /session_x2/);
+
+    const after = openDb(join(home, 'agent-bus', 'bus.db'));
+    assert.equal(after.prepare('SELECT COUNT(*) AS n FROM posts').get().n, 0,
+      '重名时必须拒绝，绝不能猜一个收件人把帖子投出去');
+    after.close();
+  } finally { cleanup(home); }
+});
+
 test('未识别的命令以退出码 1 失败并打印用法', () => {
   const home = makeTmpHome();
   try {

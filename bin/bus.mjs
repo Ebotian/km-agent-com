@@ -6,6 +6,14 @@ import * as identity from '../lib/identity.mjs';
 import * as posts from '../lib/posts.mjs';
 import * as render from '../lib/render.mjs';
 
+// 下游提前关闭（`| head -2`、分页读取）会让异步写抛 EPIPE。此时输出已无人接收，
+// 正常退出即可——这里用 process.exit 是安全的，没有缓冲需要排空。
+// 非 EPIPE 的写错误不能让进程以 0 退出（输出没送达），回落成失败码。
+const onStdoutError = (e) => { if (e.code === 'EPIPE') process.exit(0); else process.exitCode = 1; };
+process.stdout.on('error', onStdoutError);
+// stderr 是尽力而为：它挂了也不能把失败改成成功，保持既有退出码。
+process.stderr.on('error', () => {});
+
 const USAGE = `用法: node bin/bus.mjs <命令> [参数] [--json] [--home <dir>] [--session <id>]
                               [--proc-root <dir>] [--now <ms>]
 
