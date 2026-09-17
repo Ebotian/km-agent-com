@@ -128,7 +128,7 @@ posts(seq INTEGER PRIMARY KEY,              -- 单调递增，游标的基础
 -- 认领表：唯一可变的表。资源可以是路径/端口，也可以是 'task:<post.seq>'
 claims(resource TEXT PRIMARY KEY,           -- '/abs/path' | 'port:8080' | 'task:142'
        holder_session TEXT NOT NULL,
-       lease_until INTEGER NOT NULL,        -- 过期即可被他人用同一条 SQL 抢占
+       lease_until INTEGER NOT NULL,        -- 过期即可被他人用同一条 SQL 抢占（已完成的一次性资源除外）
        completed_at INTEGER,                -- 仅一次性资源（task:*）会置；路径类靠释放或过期
        note TEXT)
 
@@ -166,7 +166,8 @@ subs(reader_session TEXT, pattern TEXT,     -- 'agent-com'（含子树）、'age
      SET holder_session = excluded.holder_session,
          lease_until    = excluded.lease_until,
          completed_at   = NULL
-   WHERE claims.lease_until <= :now;
+   WHERE (claims.completed_at IS NULL AND claims.lease_until <= :now)
+      OR (claims.completed_at IS NULL AND claims.holder_session = :holder);
   ```
   影响 1 行 = 认领成功，0 行 = 已被占。**这就是把原 `tasks` 表合并进 `claims` 的理由**：两者是同一个形状——「一个有名之物被某人持有且有期限」，差别只在可复用性；一条语句、一套过期清理覆盖两者。
 - **任务不是独立实体**：一个任务就是一条 `kind='request'` 的帖子 + 一条 `resource='task:<seq>'` 的认领。因此 `posts` 不需要 `resource` / `expires_at` 列，`kind` 也不需要 `claim` 取值。

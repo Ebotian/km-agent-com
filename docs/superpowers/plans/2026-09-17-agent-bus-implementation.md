@@ -380,6 +380,7 @@ git commit -m "feat: topic.mjs 主题路径规范化与前缀匹配"
 - Produces:
   - `claim(db, {resource, holderSession, ttlMs, note = null, now}): {claimed: boolean, holder: string|null, leaseUntil: number|null}`
   - `release(db, {resource, holderSession}): {released: boolean}`
+  - `releaseAllForSession(db, {holderSession}): number` —— 会话退出时回收它名下**未完结**的租约，返回删除行数；**已完成的行必须留下**（它们是"这个一次性任务做完了"的唯一记录，删掉就等于让它重新可被认领）
   - `busy(db, {resource, now}): {held: boolean, holder: string|null, leaseUntil: number|null}`
   - `complete(db, {resource, holderSession, now}): {completed: boolean}`
   - `conflicts(db, {paths, session, now}): Array<{resource: string, holder: string, leaseUntil: number}>` —— 供 L0 使用
@@ -397,12 +398,25 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDb } from '../lib/db.mjs';
-import { claim, release, busy, complete, conflicts, reapExpired, syncMarker, markerPath } from '../lib/claims.mjs';
+import { claim, release, busy, complete, conflicts, reapExpired, releaseAllForSession, syncMarker, markerPath } from '../lib/claims.mjs';
 import { makeTmpHome, cleanup } from './helpers.mjs';
 
 function withDb(fn) {
   const home = makeTmpHome();
   try { return fn(openDb(join(home, 'bus.db')), home); } finally { cleanup(home); }
+}
+
+function rowOf(db, resource) {
+  const r = db.prepare(
+    'SELECT holder_session, lease_until, completed_at, note FROM claims WHERE resource = ?'
+  ).get(resource);
+  if (!r) return null;
+  return {
+    holder: r.holder_session,
+    leaseUntil: r.lease_until,
+    completedAt: r.completed_at,
+    note: r.note,
+  };
 }
 
 test('第一个认领成功，第二个被拒并返回持有者', () => {
@@ -484,6 +498,52 @@ test('syncMarker 反映是否存在未过期租约', () => {
     assert.equal(existsSync(mp), false);
   });
 });
+
+test('已完成资源的认领失败不修改该行', () => {
+  withDb(db => {
+    claim(db, { resource: 'task:3', holderSession: 'sA', ttlMs: 1000, now: 0, note: 'sA 做完了' });
+    complete(db, { resource: 'task:3', holderSession: 'sA', now: 10 });
+    const before = rowOf(db, 'task:3');
+    assert.deepEqual(before, { holder: 'sA', leaseUntil: 10, completedAt: 10, note: 'sA 做完了' });
+
+    const b = claim(db, { resource: 'task:3', holderSession: 'sB', ttlMs: 5000, now: 100000 });
+    assert.equal(b.claimed, false);
+    assert.deepEqual(rowOf(db, 'task:3'), before);
+  });
+});
+
+test('未完成但租约过期的 task 资源仍可被他人认领', () => {
+  withDb(db => {
+    claim(db, { resource: 'task:4', holderSession: 'sA', ttlMs: 1000, now: 0 });
+    const b = claim(db, { resource: 'task:4', holderSession: 'sB', ttlMs: 1000, now: 5000 });
+    assert.equal(b.claimed, true);
+    assert.equal(b.holder, 'sB');
+    assert.equal(rowOf(db, 'task:4').holder, 'sB');
+  });
+});
+
+test('releaseAllForSession 只回收未完结的租约，已完成的行留下', () => {
+  withDb(db => {
+    claim(db, { resource: '/p/keep', holderSession: 'sA', ttlMs: 1000, now: 0, note: '已完成' });
+    complete(db, { resource: '/p/keep', holderSession: 'sA', now: 1 });
+    claim(db, { resource: '/p/drop', holderSession: 'sA', ttlMs: 1000, now: 0 });
+    claim(db, { resource: '/p/other', holderSession: 'sB', ttlMs: 1000, now: 0 });
+
+    assert.equal(releaseAllForSession(db, { holderSession: 'sA' }), 1);
+    assert.deepEqual(rowOf(db, '/p/keep'), { holder: 'sA', leaseUntil: 1, completedAt: 1, note: '已完成' });
+    assert.equal(rowOf(db, '/p/drop'), null);
+    assert.equal(rowOf(db, '/p/other').holder, 'sB');
+    assert.equal(busy(db, { resource: '/p/drop', now: 0 }).held, false);
+  });
+});
+
+test('releaseAllForSession 对没有租约的会话返回 0', () => {
+  withDb(db => {
+    claim(db, { resource: '/p/a', holderSession: 'sA', ttlMs: 1000, now: 0 });
+    assert.equal(releaseAllForSession(db, { holderSession: 'sZ' }), 0);
+    assert.equal(rowOf(db, '/p/a').holder, 'sA');
+  });
+});
 ```
 
 - [ ] **Step 2: 运行测试，确认失败**
@@ -499,8 +559,6 @@ Expected: FAIL —— `Cannot find module '../lib/claims.mjs'`
 import { existsSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
-const isTask = (resource) => resource.startsWith('task:');
-
 export function claim(db, { resource, holderSession, ttlMs, note = null, now }) {
   const leaseUntil = now + ttlMs;
   const stmt = db.prepare(`
@@ -511,9 +569,8 @@ export function claim(db, { resource, holderSession, ttlMs, note = null, now }) 
            lease_until    = excluded.lease_until,
            note           = excluded.note,
            completed_at   = NULL
-     WHERE claims.lease_until <= :now
-        OR claims.holder_session = :holder
-        OR claims.completed_at IS NOT NULL AND claims.lease_until <= :now
+     WHERE (claims.completed_at IS NULL AND claims.lease_until <= :now)
+        OR (claims.completed_at IS NULL AND claims.holder_session = :holder)
   `);
   const info = stmt.run({ resource, holder: holderSession, leaseUntil, note, now });
   if (info.changes === 1) return { claimed: true, holder: holderSession, leaseUntil };
@@ -542,6 +599,13 @@ export function release(db, { resource, holderSession }) {
     'DELETE FROM claims WHERE resource = ? AND holder_session = ? AND completed_at IS NULL'
   ).run(resource, holderSession);
   return { released: info.changes > 0 };
+}
+
+export function releaseAllForSession(db, { holderSession }) {
+  const info = db.prepare(
+    'DELETE FROM claims WHERE holder_session = ? AND completed_at IS NULL'
+  ).run(holderSession);
+  return info.changes;
 }
 
 export function complete(db, { resource, holderSession, now }) {
@@ -596,7 +660,7 @@ export function syncMarker(db, { kimiHome, now }) {
 - [ ] **Step 4: 运行测试，确认通过**
 
 Run: `node --test test/claims.test.mjs`
-Expected: PASS，8 个用例全绿
+Expected: PASS，12 个用例全绿
 
 - [ ] **Step 5: 提交**
 
@@ -2370,7 +2434,7 @@ git commit -m "feat: bus watch 子命令（自注册/去抖轮询/strong 才退�
     | `hook_event_name` | 用到的载荷字段 | 行为 | 退出码 |
     |---|---|---|---|
     | `SessionStart` | `session_id`, `cwd`, `session_title` | 登记 presence + 种下默认订阅 | 0 |
-    | `SessionEnd` | `session_id` | 删除 presence 行、回收本会话全部租约 | 0 |
+    | `SessionEnd` | `session_id` | 删除 presence 行、回收本会话**未完结**的租约（`claims.releaseAllForSession`；已完成的行留下，否则已完成的一次性任务会重新可被认领） | 0 |
     | `PreToolUse` | `session_id`, `cwd`, `tool_name`, `tool_input` | 检查待触碰路径是否被他人占用；冲突则 exit 2 | 0 或 2 |
     | `UserPromptSubmit` | `session_id`, `cwd` | stdout 输出 digest + 聋窗口自愈提示 | 0 |
 
@@ -2695,7 +2759,7 @@ async function main() {
     const db = openDb(dbPath);
     const sid = payload.session_id || '';
     if (tuiPid != null) identity.removePresence(db, { tuiPid });
-    db.prepare('DELETE FROM claims WHERE holder_session = ?').run(sid);
+    claims.releaseAllForSession(db, { holderSession: sid });
     claims.syncMarker(db, { kimiHome: home, now });
     appendLog(home, { actor: sid || '?', action: 'session-end', detail: String(tuiPid) });
     return 0;
@@ -3492,7 +3556,7 @@ git commit -m "feat: 限流、64KB 正文上限与 prune 归档（posts 唯一�
 | spec 节 | 由哪个 Task 实现 | 状态 |
 |---|---|---|
 | §5 五张表与 CHECK 约束 | Task 1 | ✅ |
-| §5 原子认领 SQL（`ON CONFLICT ... WHERE lease_until <= :now`） | Task 3 | ✅ |
+| §5 原子认领 SQL（`ON CONFLICT ... WHERE (completed_at IS NULL AND lease_until <= :now) OR (completed_at IS NULL AND holder_session = :holder)`）—— 已完成的行永不可再被认领，无论租约是否过期 | Task 3 | ✅ **R2 修正**；该不变量由 R-E2 的 `releaseAllForSession` 收口（SessionEnd 只回收未完结的租约，已完成的行留下） |
 | §5 开放任务查询 | Task 4 `openTasks` | ✅ |
 | §6.1 层级主题与前缀订阅 | Task 2 + Task 4 `poll` | ✅ |
 | §6.3 过滤谓词 | Task 4 | ✅ **并修正了 LIKE 通配 bug** |

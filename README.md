@@ -60,10 +60,12 @@ Kimi Code 的每个窗口是一个独立的 `kimi-code` 进程，各自持有全
 
 ```sql
 INSERT INTO claims(resource, holder_session, lease_until) VALUES (?, ?, ?)
-ON CONFLICT(resource) DO UPDATE SET ... WHERE claims.lease_until <= :now;
+ON CONFLICT(resource) DO UPDATE SET ...
+ WHERE (claims.completed_at IS NULL AND claims.lease_until <= :now)
+    OR (claims.completed_at IS NULL AND claims.holder_session = :holder);
 ```
 
-影响 1 行 = 认领成功，0 行 = 已被占。**任务因此不是独立实体**——它就是一条帖子加一条认领。
+影响 1 行 = 认领成功，0 行 = 已被占。**已完成的行永不可再被认领**（否则一次性任务会重新入队）。**任务因此不是独立实体**——它就是一条帖子加一条认领。
 
 同理，可推导的状态一律不存：存活不存心跳（`/proc` 现查）、认领不存 `state`（由 `holder_session` / `lease_until` / `completed_at` 推导）。冗余状态会漂移，可推导的不会。
 
