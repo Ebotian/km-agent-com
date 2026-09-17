@@ -73,3 +73,23 @@ test('ageLabel 给出粗粒度时长', () => {
   assert.equal(r.ageLabel(0, 120_000), '2m');
   assert.equal(r.ageLabel(0, 7_200_000), '2h');
 });
+
+test('sanitize 吃掉大小写变体与不闭合的包装标签', () => {
+  assert.equal(r.sanitize('<AGENT_BUS_MESSAGE from=x>evil'), 'evil');
+  assert.equal(r.sanitize('<Agent_Bus_Message>evil'), 'evil');
+  assert.equal(r.sanitize('</AGENT_BUS_MESSAGE>evil'), 'evil');
+  assert.equal(r.sanitize('<agent_bus_message from=x').includes('agent_bus_message'), false);
+});
+
+test('sanitize 不吃掉普通尖括号文本', () => {
+  assert.equal(r.sanitize('a < b and c > d'), 'a < b and c > d');
+});
+
+test('digestBlock 只有弱投递时不报「0 条需要你处理」', () => {
+  const out = r.digestBlock({
+    strong: [], weak: [p({ seq: 143, toSession: null, title: 'FYI' })],
+    total: 1, reader: 'me', pluginRoot: '/plug',
+  });
+  assert.equal(out.includes('0 条需要你处理'), false);
+  assert.match(out, /另有 1 条/);
+});
