@@ -45,7 +45,9 @@ const USAGE = `用法: node bin/bus.mjs <命令> [参数] [--json] [--home <dir>
                                自注册为 L1 watcher 并阻塞等待；只有点名给自己的
                                强投递才退出 0（一批 @ 合并成一次退出），弱投递只累计。
                                租约到期或收到 SIGTERM/SIGINT 也退出 0；--interval 默认
-                               200（惊群去抖），--timeout 默认 43200 秒。
+                               200（惊群去抖），--timeout 默认 43200 秒、上限 86400
+                               （引擎的后台任务上限）。**命中时 stdout 必有 JSON 行；
+                               到期或信号退出时 stdout 为空**——调用方据此区分两者。
                                --max-wait 仅供测试：等够该毫秒数仍无命中则退出 3
 `;
 
@@ -413,6 +415,12 @@ function positiveInt(raw, flag) {
 }
 
 /**
+ * 引擎自己的后台任务上限（spec §6.2；§8.3 的武装用 43200，是它的一半）。
+ * 超过它的租约没有意义，而且会把 `watcher_until` 写成超出安全整数的 int64。
+ */
+const WATCH_MAX_TIMEOUT_SEC = 86400;
+
+/**
  * 自注册（watcher_pid = 自己的 pid）→ 阻塞轮询 → **只有出现点名给自己的 strong 才退出 0**。
  * 弱投递只累计，绝不开轮（一次唤醒 = 整上下文重读，见 spec §3.3）。
  *
@@ -425,9 +433,20 @@ async function cmdWatch(c) {
   // NaN/0 会让等待退化成空转（既占满 CPU 又不停查库），所以先校验再进循环。
   const interval = positiveInt(c.flags.interval ?? 200, '--interval');
   const timeoutSec = positiveInt(c.flags.timeout ?? 43200, '--timeout');
+  if (timeoutSec > WATCH_MAX_TIMEOUT_SEC) {
+    throw new Error(`--timeout 需不超过 ${WATCH_MAX_TIMEOUT_SEC} 秒（引擎的后台任务上限），收到 ${timeoutSec}`);
+  }
   const maxWait = c.flags['max-wait'] == null ? null : positiveInt(c.flags['max-wait'], '--max-wait');
   // --now 注入的是"起始时刻"：租约到期与轮询截止都以它为基准
   const until = c.now + timeoutSec * 1000;
+  // 上界单靠 --timeout 挡不住：--now 也能把到期时刻推到天上去。写进 presence 的时间戳
+  // 必须是安全整数，否则 setWatcher 不报错，但此后**任何** SELECT 它的命令
+  // （whoami/peers/digest…）都会抛 ERR_OUT_OF_RANGE 并以 1 失败——租约期内整个窗口
+  // 连自己的身份都解析不出来。校验必须在 setWatcher 之前（这里就是）。
+  if (!Number.isSafeInteger(until)) {
+    // 文案里回显用户原样输入的 --now（而不是被舍入后的 c.now），便于自查
+    throw new Error(`--now ${c.flags.now ?? '(缺省)'} 与 --timeout ${timeoutSec}s 算出的到期时刻超出安全整数范围，请检查 --now`);
+  }
 
   const waker = makeWaker();
   // 信号只在循环里处理：不在处理器里做清理与输出，退出码统一由 finish 记账
@@ -466,7 +485,12 @@ async function cmdWatch(c) {
       // 一次唤醒。这一觉**故意不接 poke**——一次 commit 会连着触发好几个 fs 事件
       // （WAL、-shm），后续事件会立刻把等待切短，把一批投递切成好几次退出。
       await delay(interval);
-      emitWatchResult(c, me, posts.poll(c.db, { reader: me.sessionId }));
+      const settled = posts.poll(c.db, { reader: me.sessionId });
+      // exit 0 必须意味着"stdout 里确实有东西给你"：合并窗口里那条 strong 可能已经被
+      // 读走（Task 10 的 UserPromptSubmit 先取，或用户此刻跑了 digest），二次 poll 于是
+      // 变空——而按 spec §3.3 的成本模型，这次空唤醒仍要付整上下文重读。所以以第一次
+      // 带 strong 的结果为地板：宁可投一份略微过时的 triage，也不投空的。
+      emitWatchResult(c, me, settled.strong.length > 0 ? settled : r);
       return finish(0, 'hit');
     }
     // 信号与租约到期都是正常收工（窗口会因此变聋，由 peers/whoami 检出后重新武装）
