@@ -107,9 +107,9 @@
 `~/.kimi-code/agent-bus/bus.db`（WAL 模式，`busy_timeout=5000`，目录 0700）
 
 ```sql
--- 在线登记（由 SessionStart/SessionEnd/SessionHeartbeat hook 维护）
+-- 在线登记（由 SessionStart / SessionEnd hook 维护，见 §8.1）
 presence(tui_pid INTEGER PRIMARY KEY, session_id TEXT, session_title TEXT,
-         cwd TEXT, handle TEXT, started_at INTEGER, heartbeat_at INTEGER)
+         cwd TEXT, handle TEXT, started_at INTEGER)
 
 -- 帖子（总线的主表，append-only）
 posts(seq INTEGER PRIMARY KEY,              -- 单调递增，游标的基础
@@ -303,24 +303,23 @@ cron 自醒（§3.2）退为"L1 的替代实现"，同样默认关闭。
 agent-com/                           插件根（仓库）
 ├── kimi.plugin.json                 manifest：hooks / skills / commands / systemPrompt
 ├── bin/
-│   ├── bus.mjs                      CLI 主体（post/read/digest/topics/peers/
-│   │                                subscribe/claim/done/log/whoami）
-│   └── bus-watch.mjs                watcher：阻塞等待匹配的消息，命中强唤醒则退出
+│   ├── bus.mjs                      CLI：post/read/digest/watch/topics/peers/
+│   │                                subscribe/claim/done/log/whoami
+│   │                                （watch 是子命令，不单独出二进制）
 ├── lib/
-│   ├── db.mjs                       schema 建立/迁移、WAL、busy_timeout
-│   ├── identity.mjs                 祖先遍历 /proc 定位所属窗口（见 §8.1）
-│   ├── topic.mjs                    主题路径与前缀匹配（含通配归一化）
-│   ├── cursor.mjs                   游标读写
+│   ├── db.mjs                       schema 建立/迁移、WAL、busy_timeout、游标读写
+│   ├── identity.mjs                 祖先遍历定位窗口 + 存活判定（见 §8.1）
+│   ├── topic.mjs                    主题路径与前缀匹配
 │   └── render.mjs                   帖子 → markdown/text/json 渲染
-├── hooks/bus-hook.mjs               统一入口：5 个事件（见 §8.2）
+├── hooks/bus-hook.mjs               统一入口：4 个事件（见 §8.2）
 ├── skills/agent-bus/SKILL.md        怎么用 CLI、怎么武装 watcher、注入防护措辞
 ├── commands/                        斜杠命令：/agent-bus:peers、:watch、:digest
 └── test/                            单元 + 集成 + e2e
 ```
 
-### 8.1 身份解析与默认订阅
+### 8.1 身份解析、存活判定与默认订阅
 
-F9 是硬约束：MCP 子进程拿不到 session id。解法：
+**身份解析。** F9 是硬约束：MCP 子进程拿不到 session id。解法：
 
 1. **祖先遍历**：沿 `/proc/<pid>/stat` 向上找到 `cmdline` 为 `kimi-code` 的进程，得到 `tui_pid`。hook 子进程（因 `shell:true`，直接父进程是 `/bin/sh`）与 Bash 拉起的 CLI 都用这一招。
 2. **在 `presence` 表汇合**：`SessionStart` hook 写入 `(tui_pid, session_id, session_title, cwd, handle)`；CLI 每次调用时读 `presence` 反查自己的 `session_id`。
@@ -330,7 +329,19 @@ F9 是硬约束：MCP 子进程拿不到 session id。解法：
 
 handle 默认取 cwd 的 basename（如 `agent-com`、`kimi-research`），冲突时加后缀；handle 只是给人看的 `@` 别名，真实身份始终是 `session_id`。
 
-### 8.2 Hooks（5 个事件，统一入口）
+**存活判定：不靠心跳，靠现查。** 原设计用 `SessionHeartbeat` hook（每 60s）+ `presence.heartbeat_at` 判活——这是冗余的。`SessionHeartbeat` 的定时器**每 60 秒会在每个窗口拉起一个 node 进程**（冷启动约 40ms），只为写一个时间戳，正是本设计一直在批评的"急切"做法。同一件事可以零成本现查：
+
+```
+alive(pid) := process.kill(pid, 0) 成功   且   /proc/<pid>/cmdline 是 kimi-code
+```
+
+实测（2026-09-17）：扫描 `/proc` 下 375 个 pid，靠 `cmdline` 命中 kimi-code 窗口 1 个，并顺带读到它的 cwd。加 `cmdline` 校验是为了防 pid 复用——单靠 `process.kill(pid,0)`，一个被回收后又分配给别的进程的 pid 会被误判成活着的窗口。
+
+**实现陷阱**：node 会重写 `process.title`，所以 `/proc/<pid>/cmdline` 里 `kimi-code` 后面跟着**一长串空格填充**。别用精确相等判断，用 `/^kimi-code\s*$/`。
+
+于是**删掉 `SessionHeartbeat` hook 与 `presence.heartbeat_at`**：少一个 hook、少一列、少掉每窗口每分钟一次的进程拉起。清理由任何一次 `bus` 命令或 watcher 的 tick 顺带完成——这本来也必须做，因为被 SIGKILL 的窗口不会有 `SessionEnd`。
+
+### 8.2 Hooks（4 个事件，统一入口）
 
 manifest 里 `command` 写 `node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"`（shell 展开，F11），`timeout = 5`，全部 fail-open。
 
@@ -339,8 +350,9 @@ manifest 里 `command` 写 `node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"`（shell
 | **`PreToolUse`** | `Write\|Edit\|Bash` | **L0 访问点强制**：检查本次要碰的资源是否被 `claim` 占用，冲突即拒绝 | exit 2 + stderr 说明 → 工具被拒，原因进上下文 |
 | `SessionStart` | — | 祖先遍历 → upsert `presence`（含 handle）+ 种下默认订阅 | 无（只要副作用） |
 | `SessionEnd` | — | 删除 `presence` 行；回收该 session 名下的 `tasks` 租约 | 无 |
-| `SessionHeartbeat` | — | 刷新 `heartbeat_at`；清扫死 pid（`process.kill(pid,0)`） | 无（F8：本来被丢弃） |
 | `UserPromptSubmit` | — | ① 注入未读摘要（L2 弱投递）② **自愈检查**：本窗口 watcher 不在就提醒模型重新武装 | exit 0 + stdout 文本 → `<hook_result>` user 消息 |
+
+四个事件里只有 `PreToolUse` 与 `UserPromptSubmit` 有返回值语义，另外两个纯做副作用。
 
 `PreToolUse` 挂在**每次工具调用的关键路径**上，而 hook 是 shell 拉起的进程（`node` 冷启动约 40ms）。所以它必须先做一层零成本的 shell 预检，只在存在活跃租约时才启动 node：
 
@@ -351,11 +363,9 @@ exec node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"
 
 `claims.marker` 有未过期 `claim` 时存在、最后一个租约释放时删除。**拦截失败必须放行（fail-open），不能阻塞**——否则总线一挂就卡死所有窗口的工具调用。
 
-`SessionHeartbeat` 是"判定哪个窗口还活着"的正解——正是 F2 缺失的能力。输出虽被丢弃，但副作用有效。
-
 ### 8.3 watcher 生命周期与自愈
 
-- **武装**：skill 指示 agent 在会话开始、以及每次被唤醒处理完之后，起一个后台任务：`node $KIMI_PLUGIN_ROOT/bin/bus-watch.mjs --session <id> --timeout 43200`。
+- **武装**：skill 指示 agent 在会话开始、以及每次被唤醒处理完之后，起一个后台任务：`node $KIMI_PLUGIN_ROOT/bin/bus.mjs watch --session <id> --timeout 43200`。
 - **幂等**：武装前先用 `bus whoami --json` 检查本 session 是否已有 watcher（`presence` 表记 `watcher_pid`），避免堆叠。
 - **自愈**：watcher 可能因关机、超时、进程被杀而死。`UserPromptSubmit` hook 每次用户说话时检查 `watcher_pid` 是否还活着，不活就注入提示。这样下次交互自动恢复。
 - **撤下**：`/agent-bus:watch off` 或 skill 指示"用户明确说不想被通知时不要武装"。
@@ -376,7 +386,7 @@ exec node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"
 
 | 场景 | 处理 |
 |---|---|
-| `presence` 条目对应 pid 已死 | `process.kill(pid,0)` 判活（ESRCH=死）；`SessionHeartbeat` 与 `bus peers` 调用时清扫 |
+| `presence` 条目对应 pid 已死或 pid 被复用 | `process.kill(pid,0)` + `cmdline` 校验（§8.1）；清扫由任何一次 `bus` 命令或 watcher tick 顺带完成 |
 | CLI 找不到自己的 `presence` 条目 | 降级：用 cwd 作回退身份，并在输出里提示"本窗口未登记，请检查插件 hooks" |
 | `@` 的目标不在 `presence` | 帖子照常落库（对方下次存在时游标能读到），返回 `delivered: deferred` + 候选 handle 列表 |
 | 认领任务返回 0 行 | 正常结果（被别人抢先），返回 `claimed: false` + 当前 owner |
@@ -394,17 +404,20 @@ exec node "$KIMI_PLUGIN_ROOT/hooks/bus-hook.mjs"
 | 点对点邮箱 | 论坛（板块） | 存在性取代寻址；支持原子认领 |
 | 常驻 60s cron 自醒 | 后台 watcher 事件驱动 | §3.3：轮询成本 = 频率 × 持续增长的上下文 |
 | `acked:[ids]` 游标 | 每读者一行 `read_cursor` | 不随消息数增长 |
-| （无） | 订阅 / `@` / 两级唤醒 | 本轮新增 |
+| （无） | 订阅 / `@` / 分层投递 L0–L3 | 本轮新增 |
+| `room` + `topic` 两字段 | 单一层级主题路径 | 同一轴上的两个概念，冗余（§6.1） |
+| `SessionHeartbeat` + `heartbeat_at` 判活 | `pidAlive` + `cmdline` 现查 | 两套存活判定重复，且心跳要每窗口每分钟拉起进程（§8.1） |
 
-v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历身份解析（§8.1）、`SessionHeartbeat` 做 presence、prompt injection 防护思路、fail-open 的 hook 约定。
+v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历身份解析（§8.1）、prompt injection 防护思路、fail-open 的 hook 约定。
 
 ## 12. 测试策略
 
-- **单元**：寻址解析（handle/pid/session/`@all`）、过滤谓词构造、强/弱唤醒判定、游标推进、渲染。
+- **单元**：主题路径解析与前缀匹配、寻址解析（handle/pid/session）、过滤谓词构造、强/弱唤醒判定、游标推进、渲染。
 - **DB 集成**：多进程并发投递不丢不重（照 §3.3 的 F15 探针扩展）、WAL 崩溃恢复、`SQLITE_BUSY` 重试、schema 迁移。
 - **并发认领**：N 个进程同时认领同一任务，断言恰好一个成功。
 - **watcher**：命中强唤醒即退出；命中弱投递不退出只累加；`fs.watch` 失效时轮询兜底仍能唤醒。
-- **hook**：喂 stdin JSON，断言 exit code / stdout / `presence` 变化；`UserPromptSubmit` 的自愈提示。
+- **hook**：喂 stdin JSON，断言 exit code / stdout / `presence` 变化；`PreToolUse` 的拒绝路径与 fail-open 路径；`UserPromptSubmit` 的自愈提示。
+- **存活判定**：伪造 pid 复用场景（用另一个非 kimi 进程占住 pid）断言不会误判为活窗口。
 - **端到端（必须做）**：开 A、B 两个真实窗口，覆盖——B 空闲时 `@B` 秒级送达；B 忙时 `Stop` 注入；B 未开时消息留存并在 B 下次启动后被读到；用户回到 B 时 `UserPromptSubmit` 投递未读；watcher 被杀后的自愈。
 
 **已通过的前置 spike**：两条唤醒通道均实测成立（§3.1、§3.2）。这是本设计唯一的结构性风险，已排除。
@@ -413,11 +426,11 @@ v1 中仍然成立并保留的部分：F1–F13 的事实梳理、祖先遍历�
 
 接口（§5 schema / §6 谓词 / §8 组件边界）一旦冻结，以下单元可并行开发：
 
-1. `lib/db.mjs` + schema + 迁移（纯 node，无依赖）
-2. `lib/identity.mjs` 祖先遍历 + `presence` upsert/清扫
+1. `lib/db.mjs` + schema + 迁移 + 游标（纯 node，无依赖）
+2. `lib/identity.mjs` 祖先遍历 + 存活判定 + `presence` upsert/清扫
 3. `bin/bus.mjs` CLI 命令面（依赖 1、2）
-4. `bin/bus-watch.mjs` watcher（依赖 1、2、6.3 谓词）
-5. `hooks/bus-hook.mjs` 5 个事件（含 `PreToolUse` 的 L0 拦截；依赖 1、2）
+4. `bin/bus.mjs watch` 子命令（依赖 1、2、6.3 谓词）
+5. `hooks/bus-hook.mjs` 4 个事件（含 `PreToolUse` 的 L0 拦截；依赖 1、2）
 6. `kimi.plugin.json` + skill + commands（含 watcher 武装指示、注入防护措辞）
 7. 测试与 e2e 脚本
 8. README / 安装说明
