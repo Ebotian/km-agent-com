@@ -1,13 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { openDb } from '../lib/db.mjs';
 import * as identity from '../lib/identity.mjs';
 import * as claims from '../lib/claims.mjs';
 import * as posts from '../lib/posts.mjs';
 import {
   makeTmpHome, cleanup, procRootOf, seedWindow, seedProcEntry, runCli, runHook, runHookAsync,
+  runHookInFakeWindow, HOOK,
 } from './helpers.mjs';
 
 const SESSION = 'session_aaaa-bbbb';
@@ -251,6 +252,37 @@ test('UserPromptSubmit 在本窗口没有 presence 行时按"从未武装"提示
 });
 
 /**
+ * Bug B 的同类残留：重新武装那一行是**写进 agent 上下文**的提示，而 hook 以前拿
+ * `process.env.KIMI_PLUGIN_ROOT || '.'` 拼它的路径。hook 进程里那个变量确实有（引擎注入），
+ * 但"提示行指向哪份脚本"不该取决于"当前进程恰好有没有某个环境变量"——CLI 侧就是反例
+ * （agent 的 `Bash` 环境里没有它，同一行于是渲染成 `node ./bin/bus.mjs …`）。
+ *
+ * 现在插件根靠 hook 自己定位（`hooks/` 的上一级），所以这里**故意不设**那个变量，
+ * 断言同一行照样是**存在的绝对路径**，且往上两级算出的插件根里认得 `kimi.plugin.json`。
+ */
+test('UserPromptSubmit 的重新武装行在 KIMI_PLUGIN_ROOT 缺席时仍是存在的绝对路径', () => {
+  const home = makeTmpHome();
+  try {
+    const r = runHook(event('UserPromptSubmit'), { home, tuiPid: ME_PID, pluginRoot: null });
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /重新武装/, '没有 presence 行 ⇒ 从未武装 ⇒ 必须提示重新武装');
+    assert.equal(r.stdout.includes('./bin/bus.mjs'), false,
+      `提示行不能是相对路径（agent 照抄时相对它的 cwd 解析）:\n${r.stdout}`);
+
+    const line = r.stdout.split('\n').find(l => l.includes('重新武装:'));
+    assert.ok(line, `没有重新武装行:\n${r.stdout}`);
+    const m = /重新武装: node (.+) watch --timeout 43200$/.exec(line);
+    assert.ok(m, `重新武装行必须是 node <绝对路径>/bin/bus.mjs watch --timeout 43200，实际: ${line}`);
+    assert.equal(existsSync(m[1]), true, `提示行给的脚本必须真的存在：${m[1]}`);
+    assert.equal(m[1], HOOK.replace(/[\\/]hooks[\\/]bus-hook\.mjs$/, '/bin/bus.mjs'),
+      'hook 提示的那份 CLI 必须与 hook 同属一个插件根');
+    const root = dirname(dirname(m[1]));
+    assert.equal(existsSync(join(root, 'kimi.plugin.json')), true,
+      `自定位出的插件根里必须有 kimi.plugin.json（\`..\` 的层数写对了吗）：${root}`);
+  } finally { cleanup(home); }
+});
+
+/**
  * R5：夹具必须真的健康——armed watcher 的 pid 要能在**假 /proc** 里查到 bus-watch。
  * 没有它，`deaf` 是 'never'，实现会"正确地"提示从未武装 ⇒ stdout 非空 ⇒ 这条用例必挂；
  * 而用例的意图恰恰是"未武装就该提醒"，所以挂的原因不在实现。
@@ -288,8 +320,52 @@ test('SessionStart 认不出自己的窗口时不写 presence（退出 0）', ()
     const db = dbOf(home);
     assert.equal(db.prepare('SELECT COUNT(*) AS c FROM presence').get().c, 0, '认不出窗口就不该留下没人能回收的行');
     db.close();
+
+    // **认不出窗口必须留痕。** 这条分支以前是彻底静默的：不开库、不写日志、什么都不剩，
+    // 于是"窗口从未登记"这类缺陷在现场可以整轮潜伏（本次这个就是）。
+    const entries = JSON.parse(runCli(['log', '--json', '--home', home], { home }).stdout);
+    const hit = entries.find(e => e.action === 'session-start-unidentified');
+    assert.ok(hit, `审计里应有 session-start-unidentified，实际 ${JSON.stringify(entries.map(e => e.action))}`);
+    assert.equal(hit.actor, SESSION);
+    assert.match(hit.detail, /self=\d+ ppid=\d+/, '明细要能看出 hook 自己的 pid 与父进程，才可现场自查');
+    assert.match(hit.detail, /cwd=\/p\/agent-com/);
   } finally { cleanup(home); }
 });
+
+/**
+ * **本 bug 的真钉子**：不注入 `AGENT_BUS_TUI_PID`，让 SessionStart 跑真实那条祖先 walk。
+ *
+ * 为什么以前抓不到：仓库里所有 hook 用例都靠 `AGENT_BUS_TUI_PID` 指定 pid，那条 walk
+ * 从来没跑过。而它错在"从传进来的 pid 往上找、把起点那一层跳过去"——只有生产里
+ * `/bin/sh -c "单条命令"` 把命令 **exec 掉**之后的那条链（hook 的直接父进程**就是**窗口）
+ * 才暴露，表现是窗口**静默**不登记。
+ *
+ * 两种祖先链形态各跑一次、各用一个临时 home：中间隔着 shell，与 shell 被 exec 掉。断言
+ * 两者都写出了 presence 行，且 `tui_pid` 正是那个假窗口——"解出的是我自己所属的窗口"，
+ * 不是链上更远的别的窗口。
+ */
+test('不注入 AGENT_BUS_TUI_PID：真实祖先 walk 认得自己那一层，两种链形态都登记上窗口',
+  { skip: process.platform !== 'linux' }, () => {
+    for (const [what, cmd] of [
+      ['shell 被 exec 掉（生产形态）', `node "${HOOK}"`],
+      ['中间隔着 shell（复合命令，sh 不能 exec）', `node "${HOOK}"; :`],
+    ]) {
+      const home = makeTmpHome();
+      try {
+        const r = runHookInFakeWindow(event('SessionStart', { session_title: 'T' }), { home, cmd });
+        assert.ok(r.windowPid, `${what}: 假窗口没起来（${r.stderr.trim()}）`);
+        assert.equal(r.hookStatus, 0, `${what}: hook 退出 ${r.hookStatus}：${r.stderr.trim()}`);
+
+        const db = dbOf(home);
+        const n = db.prepare('SELECT COUNT(*) AS c FROM presence').get().c;
+        const row = db.prepare('SELECT * FROM presence WHERE tui_pid = ?').get(r.windowPid);
+        db.close();
+        assert.ok(row, `${what}: 窗口没登记上（presence 有 ${n} 行，没有 pid ${r.windowPid}）`);
+        assert.equal(row.session_id, SESSION);
+        assert.equal(row.handle, HANDLE, 'handle 由 cwd 推出');
+      } finally { cleanup(home); }
+    }
+  });
 
 /**
  * R-H2：`handleFromCwd` + `upsertPresence` 两步之间有读-写间隙，并发开窗会同 cwd 撞名

@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { openDb } from '../lib/db.mjs';
 import * as identity from '../lib/identity.mjs';
 import * as posts from '../lib/posts.mjs';
-import { makeTmpHome, cleanup, CLI, REPO, runCli, seedWindow } from './helpers.mjs';
+import { cliEnv, makeTmpHome, cleanup, CLI, runCli, seedWindow } from './helpers.mjs';
 
 /**
  * 窗口 me（pid 100）用成对夹具一次种下假 /proc 与 presence 行。
@@ -23,10 +23,10 @@ function seedHome() {
   return { home, procRoot };
 }
 
-function startWatch(home, procRoot, extra = []) {
+function startWatch(home, procRoot, extra = [], opts = {}) {
   const child = spawn(process.execPath, [CLI, 'watch', '--session', 'me', '--home', home,
     '--proc-root', procRoot, '--interval', '50', ...extra], {
-    env: { ...process.env, KIMI_CODE_HOME: home, KIMI_PLUGIN_ROOT: REPO, AGENT_BUS_PROC_ROOT: procRoot },
+    env: cliEnv({ home, procRoot, ...opts }),
   });
   let stdout = '';
   let stderr = '';
@@ -366,5 +366,33 @@ test('M5：--json 模式下非命中退出同样是单行 JSON，且不带 stron
     assert.equal('strong' in payload, false, '没有命中就不该有 strong，否则调用方会读成一次唤醒');
     assert.equal(payload.reason, 'timeout');
     assert.match(payload.message, /本轮无消息/);
+  } finally { w.child.kill('SIGKILL'); cleanup(home); }
+});
+
+/**
+ * Bug B 的同类残留（同 cli.test.mjs 那条）。到期提示里的"重新武装"命令是**写进 agent
+ * 上下文**的，agent 很可能直接照抄；以前它拿 `KIMI_PLUGIN_ROOT` 拼路径，而 agent 的
+ * `Bash` 环境里没有这个变量，那行于是变成 `node ./bin/bus.mjs watch …`——相对 agent 的
+ * cwd 解析、看起来能照抄却跑不通。
+ *
+ * 这里**故意不设** `KIMI_PLUGIN_ROOT`（`pluginRoot: null`），也就是生产里 agent 侧的形态。
+ */
+test('M5：到期提示的重新武装命令在 KIMI_PLUGIN_ROOT 缺席时仍是存在的绝对路径', async () => {
+  const { home, procRoot } = seedHome();
+  const w = startWatch(home, procRoot, ['--timeout', '1'], { pluginRoot: null });
+  try {
+    assert.equal(await waitExit(w.child, 8000), 0, w.stderr);
+    assert.equal(w.stdout.includes('./bin/bus.mjs'), false,
+      `提示行不能是相对路径（agent 照抄时相对它的 cwd 解析）:\n${w.stdout}`);
+
+    const line = w.stdout.split('\n').find(l => l.includes('重新武装:'));
+    assert.ok(line, `没有重新武装行:\n${w.stdout}`);
+    const m = /重新武装: node (.+) watch --timeout 43200$/.exec(line);
+    assert.ok(m, `重新武装行必须是 node <绝对路径>/bin/bus.mjs watch --timeout 43200，实际: ${line}`);
+    assert.equal(existsSync(m[1]), true, `提示行给的脚本必须真的存在：${m[1]}`);
+    assert.equal(m[1], CLI, '提示行必须指向正在跑的那一份脚本');
+    const root = dirname(dirname(m[1]));
+    assert.equal(existsSync(join(root, 'kimi.plugin.json')), true,
+      `自定位出的插件根里必须有 kimi.plugin.json（\`..\` 的层数写对了吗）：${root}`);
   } finally { w.child.kill('SIGKILL'); cleanup(home); }
 });

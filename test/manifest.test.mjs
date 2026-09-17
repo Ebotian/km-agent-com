@@ -58,3 +58,29 @@ test('manifest 引用的路径全部存在且在插件根内', () => {
     assert.ok(existsSync(join(REPO, 'commands', `${c}.md`)), `commands/${c}.md 不存在`);
   }
 });
+
+/** 取 ``` 围起来的片段——**agent 会照抄执行的就是这些**，所以只有它们必须逐字可用 */
+function fencedBlocks(text) {
+  return [...text.matchAll(/```[^\n]*\n([\s\S]*?)```/g)].map(m => m[1]);
+}
+
+const AGENT_FACING = ['skills/agent-bus/SKILL.md', 'commands/peers.md', 'commands/watch.md', 'commands/digest.md'];
+
+/**
+ * 给 agent 照抄的片段里**不许**出现 `${KIMI_PLUGIN_ROOT}`（实测踩过：它只注入插件 hook
+ * 进程，agent 的 `Bash` 环境里没有它，`node "${KIMI_PLUGIN_ROOT}/bin/bus.mjs"` 于是展开成
+ * `node "/bin/bus.mjs"` ⇒ 每条命令都失败，而 skill 正文看起来完全正常）。
+ *
+ * 只有**代码片段**受这条约束：正文里为了讲清"为什么不能这么写"而提到那个变量是允许的。
+ */
+test('skill / 命令里给 agent 照抄的片段不出现 ${KIMI_PLUGIN_ROOT}', () => {
+  for (const rel of AGENT_FACING) {
+    for (const block of fencedBlocks(readFileSync(join(REPO, rel), 'utf8'))) {
+      assert.ok(!block.includes('${KIMI_PLUGIN_ROOT}'),
+        `${rel} 的片段里还有 ${'${KIMI_PLUGIN_ROOT}'}：agent 的 Bash 环境里它是空的，会展开成 /bin/bus.mjs`);
+    }
+  }
+  const blocks = fencedBlocks(readFileSync(join(REPO, 'skills/agent-bus/SKILL.md'), 'utf8'));
+  assert.ok(blocks.some(b => b.includes('${KIMI_SKILL_DIR}/../../bin/bus.mjs')),
+    'skill 正文要用 ${KIMI_SKILL_DIR}/../.. 指插件根（那是引擎会替换的占位符）');
+});

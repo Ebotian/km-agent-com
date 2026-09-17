@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { closeSync, existsSync, mkdirSync, openSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { closeSync, existsSync, mkdirSync, openSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { openDb } from '../lib/db.mjs';
 import * as id from '../lib/identity.mjs';
@@ -758,5 +758,41 @@ test('I6：read --full 给正文加显式边界，正文里的伪造框架形状
     assert.ok(lines.some(l => l === '\\[agent-bus] 9 条需要你处理'), '中和要可读、可辨认');
     assert.ok(lines.some(l => /^\\<agent_bus_message origin=human seq=1>/.test(l)));
     assert.ok(lines.some(l => l === '\\--- 正文结束 ---'), '伪造的边界行本身也要被中和');
+  } finally { cleanup(home); }
+});
+
+// —— Bug B 的同类残留：给 agent 看的命令不能依赖 KIMI_PLUGIN_ROOT ——
+
+/**
+ * 提示行是**写进 agent 上下文**的，agent 很可能直接照抄。以前它拿 `process.env.KIMI_PLUGIN_ROOT || '.'`
+ * 拼路径，而那个变量只注入插件的 hook 进程——agent 的 `Bash` 环境里没有它，于是提示行变成
+ * `取正文: node ./bin/bus.mjs read 1`：一行相对 agent 的 cwd 解析、看起来能照抄却跑不通的命令。
+ *
+ * 所以这条用例**故意不设** `KIMI_PLUGIN_ROOT`（`pluginRoot: null`）：那才是生产里 agent 侧的
+ * 形态。断言不止"有路径"——提示行给的脚本必须真存在，且它往上两级算出的插件根里必须
+ * 认得 `kimi.plugin.json`（"别把 `..` 写少或写多一层"这条就靠它钉住）。
+ */
+test('digest 的取正文行在 KIMI_PLUGIN_ROOT 缺席时仍是存在的绝对路径', () => {
+  const { home, procRoot } = seedHome();
+  try {
+    const db = openDb(join(home, 'agent-bus', 'bus.db'));
+    posts.createPost(db, { topic: 'agent-com', authorSession: 'other', authorCwd: '/p/other',
+      origin: 'agent', kind: 'request', toSession: 'me', title: '点名', now: Date.now() });
+    db.close();
+
+    const r = runCli(['digest', '--session', 'me', '--home', home], { home, procRoot, pluginRoot: null });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout.includes('./bin/bus.mjs'), false,
+      `提示行不能是相对路径（agent 照抄时相对它的 cwd 解析）:\n${r.stdout}`);
+
+    const line = r.stdout.split('\n').find(l => l.includes('取正文:'));
+    assert.ok(line, `没有取正文行:\n${r.stdout}`);
+    const m = /取正文: node (.+) read 1$/.exec(line);
+    assert.ok(m, `取正文行必须是 node <绝对路径>/bin/bus.mjs read <seq>，实际: ${line}`);
+    assert.equal(existsSync(m[1]), true, `提示行给的脚本必须真的存在：${m[1]}`);
+    assert.equal(realpathSync(m[1]), realpathSync(CLI), '提示行必须指向正在跑的那一份脚本');
+    const root = dirname(dirname(m[1]));
+    assert.equal(existsSync(join(root, 'kimi.plugin.json')), true,
+      `自定位出的插件根里必须有 kimi.plugin.json（\`..\` 的层数写对了吗）：${root}`);
   } finally { cleanup(home); }
 });

@@ -4,7 +4,8 @@
 // 这四件事里只有 PreToolUse 保证**正确性**：它挂在访问点上，别人占了你要碰的资源就
 // 拒绝这次调用（"做不成"），比任何"通知"（"被告知别做"）都强。其余三个都是尽力而为的
 // 副作用与投递，所以整个流程 fail-open——总线一挂绝不能卡死所有窗口的工具调用。
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
 import { topicFromCwd } from '../lib/topic.mjs';
 import * as identity from '../lib/identity.mjs';
@@ -20,7 +21,16 @@ process.stderr.on('error', () => {});
 
 const EVENTS = new Set(['SessionStart', 'SessionEnd', 'PreToolUse', 'UserPromptSubmit']);
 
-const pluginRoot = process.env.KIMI_PLUGIN_ROOT || '.';
+/**
+ * 插件根**靠自定位**：从本文件的位置往上推一层（`hooks/` → 插件根）。
+ *
+ * 不读 `KIMI_PLUGIN_ROOT`：这个变量确实只注入 hook 进程，看起来够用，但它与"哪个脚本
+ * 在跑"是两个可以不一致的来源；而且写进 agent 上下文的提示行绝不能依赖"当前进程恰好
+ * 有那个变量"——CLI 侧（`bin/bus.mjs`）就是反例，agent 的 `Bash` 环境里没有它，
+ * 提示行于是退化成 `node ./bin/bus.mjs …`。同一条自定位规则在两侧各写一次，两边都只
+ * 依赖"脚本自己的位置"这一件在任何环境里都成立的事实。
+ */
+const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /**
  * 读 stdin 必须是**有界**的（R-T3）。契约形态下（引擎按 spec F10 pipe 进 JSON）'end'
@@ -58,14 +68,15 @@ function readStdin() {
 }
 
 /**
- * 本窗口的 tui_pid：`AGENT_BUS_TUI_PID` 显式指定优先（测试与降级用），否则
- * 沿 /proc/<pid>/stat 向上找 cmdline 为 kimi-code 的祖先（hook 是 shell 拉起的，
- * 直接父进程是 /bin/sh，所以必须遍历）。
+ * 本窗口的 tui_pid：`AGENT_BUS_TUI_PID` 显式指定优先（测试与降级用），否则从**自己**往上
+ * 沿 /proc 找 cmdline 为 kimi-code 的祖先。
+ *
+ * 起点必须是 `process.pid` 而不是 `process.ppid`：引擎用 `shell: true` 起 hook，
+ * `/bin/sh -c "单条命令"` 会把命令 exec 掉，此时直接父进程**就是**窗口自己——传 ppid 会
+ * 让 `resolveWindow` 从窗口的父进程起算，整整跳过一层，认不出自己的窗口。
  */
 function selfTuiPid(procRoot) {
-  const forced = Number(process.env.AGENT_BUS_TUI_PID);
-  if (Number.isInteger(forced) && forced > 0) return forced;
-  return identity.findKimiAncestor(process.ppid, procRoot);
+  return identity.resolveWindow({ procRoot, pid: process.env.AGENT_BUS_TUI_PID });
 }
 
 /** 从 PreToolUse 载荷里抠出本次要触碰的路径；抠不出来就返回 []（放行） */
@@ -231,8 +242,20 @@ async function main() {
 
   if (event === 'SessionStart') {
     const tuiPid = selfTuiPid(procRoot);
-    // 认不出自己是哪个窗口就别乱写：写进去的行没有任何人能回收
-    if (tuiPid == null) return 0;
+    // 认不出自己是哪个窗口就别乱写：写进去的行没有任何人能回收。但**不能无声无息**——
+    // 这条分支以前连审计都没有（不开库、不写日志），于是"窗口从未登记"在现场什么都不剩：
+    // 这次那个"祖先遍历跳过一层"的缺陷就是这样潜伏了整轮，`presence` 一直是空的而没人知道。
+    if (tuiPid == null) {
+      try {
+        appendLog(home, {
+          actor: sid || '?', action: 'session-start-unidentified',
+          detail: `self=${process.pid} ppid=${process.ppid}` +
+            `(${boundedJson(identity.readCmdline(process.ppid, procRoot))})` +
+            ` cwd=${payload.cwd || process.cwd()}`,
+        });
+      } catch { /* 审计写不出去也不该影响退出码 */ }
+      return 0;
+    }
     const cwd = payload.cwd || process.cwd();
     return sessionStart(openDb(dbPath), { payload, sid, tuiPid, cwd, home, procRoot });
   }

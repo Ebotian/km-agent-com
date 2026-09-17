@@ -35,6 +35,21 @@ git clone https://github.com/Ebotian/km-agent-com.git ~/km-agent-com
 hook 进程的工作目录被引擎设成插件根，并额外注入 `KIMI_CODE_HOME` 与 `KIMI_PLUGIN_ROOT`——
 manifest 那条零成本预检就是靠 `KIMI_CODE_HOME`（缺席时回退 `$HOME/.kimi-code`）找 `claims.marker`。
 
+### `KIMI_PLUGIN_ROOT` 只在 hook 进程里，别指望 agent 的 `Bash` 看到它
+
+引擎只把 `KIMI_PLUGIN_ROOT` 注入**插件的 hook 进程**；agent 的 `Bash` 工具继承的是 TUI
+进程的环境，里面**没有**它（实测：在真实窗口的 `Bash` 里 `echo "${KIMI_PLUGIN_ROOT:-未设置}"`
+打印"未设置"）。所以任何**给 agent 看的**片段都不能写 `node "${KIMI_PLUGIN_ROOT}/bin/bus.mjs"`
+——它会展开成 `node "/bin/bus.mjs"` 而失败。
+
+- **skill 正文**：用 `${KIMI_SKILL_DIR}/../../bin/bus.mjs`。`${KIMI_SKILL_DIR}` 是引擎在 skill
+  正文里会替换的占位符（值是 `SKILL.md` 所在目录，本插件即 `<插件根>/skills/agent-bus`），
+  往上两级就是插件根。
+- **斜杠命令正文**：只替换 `$ARGUMENTS`，**`${KIMI_SKILL_DIR}` 与 `${KIMI_PLUGIN_ROOT}` 都不
+  会展开**。所以 `commands/*.md` 不自己拼路径，而是让 agent 先加载 `agent-bus` skill、照
+  skill 正文里的绝对路径执行。
+- **终端里人手动跑**：用绝对路径（本页「验证」一节就是），与环境变量无关。
+
 ## 验证
 
 在任何窗口里：

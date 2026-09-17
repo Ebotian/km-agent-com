@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO = dirname(HERE);
 export const CLI = join(REPO, 'bin', 'bus.mjs');
 export const HOOK = join(REPO, 'hooks', 'bus-hook.mjs');
+export const FAKE_WINDOW = join(HERE, 'fixtures', 'kimi-window.js');
 
 export function makeTmpHome() {
   return mkdtempSync(join(tmpdir(), 'agent-bus-test-'));
@@ -83,37 +84,52 @@ export function seedWindow(home, {
   return procRoot;
 }
 
-export function runCli(args, { home, procRoot, input = '', env = {} } = {}) {
+/**
+ * CLI 子进程的环境（`runCli` 与需要自己 `spawn` 的用例共用一套）。
+ *
+ * `pluginRoot: null` 表示**这个变量整个不存在**。这不是可选的边角：agent 的 `Bash` 工具
+ * 继承的是 TUI 进程的环境，里面没有 `KIMI_PLUGIN_ROOT`（它只在插件的 hook 进程里有），
+ * 所以"给 agent 看的命令"必须在这个形态下也成立。删掉而不是留空串/undefined——依赖
+ * "undefined 会被 spawnSync 丢掉"太隐晦，而空串是另一个值，测出来的东西不一样。
+ */
+export function cliEnv({ home, procRoot, pluginRoot = REPO, env = {} } = {}) {
   // 缺 home 时不要往下传：env 里的 undefined 会被 Node 丢掉，KIMI_CODE_HOME 于是一整个缺席，
   // CLI 的 kimiHome() 会回落到真实的 ~/.kimi-code——测试绝不能读到/写到开发者的真实家目录。
-  if (!home) throw new Error('runCli 需要 home');
+  if (!home) throw new Error('cliEnv 需要 home');
+  const e = {
+    ...process.env,
+    KIMI_CODE_HOME: home,
+    KIMI_PLUGIN_ROOT: pluginRoot,
+    ...(procRoot ? { AGENT_BUS_PROC_ROOT: procRoot } : {}),
+    ...env,
+  };
+  if (pluginRoot == null) delete e.KIMI_PLUGIN_ROOT;
+  return e;
+}
+
+export function runCli(args, { home, procRoot, input = '', env = {}, pluginRoot = REPO } = {}) {
   const r = spawnSync(process.execPath, [CLI, ...args], {
     input,
     encoding: 'utf8',
-    env: {
-      ...process.env,
-      KIMI_CODE_HOME: home,
-      KIMI_PLUGIN_ROOT: REPO,
-      ...(procRoot ? { AGENT_BUS_PROC_ROOT: procRoot } : {}),
-      ...env,
-    },
+    env: cliEnv({ home, procRoot, pluginRoot, env }),
   });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
 
 /**
- * hook 的环境。两条都会咬人的规矩：
- * - **缺 home 直接抛错**，与 runCli 同因：`spawnSync` 会丢掉值为 undefined 的 env 键，
+ * hook 的环境。三条都会咬人的规矩：
+ * - **缺 home 直接抛错**，与 cliEnv 同因：`spawnSync` 会丢掉值为 undefined 的 env 键，
  *   `KIMI_CODE_HOME` 一缺席，`kimiHome()` 就回落到开发者真实的 `~/.kimi-code`，
  *   测试会静默读写真实家目录。
  * - `AGENT_BUS_PROC_ROOT` 默认指向**这个 home 里的假 /proc**（`procRootOf(home)`）：
  *   hook 的 `SessionStart` 会调 `identity.reapDead`，它拿 procRoot 核对每条 presence 行的
  *   tui_pid 是不是活着的 kimi-code。若让它落到真实 /proc，夹具里那些假 pid（100…）会被
  *   当场清掉，症状是"刚登记的 presence 行凭空消失"，离现场很远。
+ * - `pluginRoot: null` ⇒ 不设 `KIMI_PLUGIN_ROOT`（同 cliEnv 的说明）。
  */
 function hookEnv({ home, procRoot, pluginRoot = REPO, env = {}, tuiPid = null } = {}) {
   if (!home) throw new Error('runHook 需要 home');
-  return {
+  const e = {
     ...process.env,
     KIMI_CODE_HOME: home,
     KIMI_PLUGIN_ROOT: pluginRoot,
@@ -121,6 +137,8 @@ function hookEnv({ home, procRoot, pluginRoot = REPO, env = {}, tuiPid = null } 
     ...(tuiPid != null ? { AGENT_BUS_TUI_PID: String(tuiPid) } : {}),
     ...env,
   };
+  if (pluginRoot == null) delete e.KIMI_PLUGIN_ROOT;
+  return e;
 }
 
 export function runHook(payload, opts = {}) {
@@ -131,6 +149,54 @@ export function runHook(payload, opts = {}) {
     env: hookEnv(opts),
   });
   return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+}
+
+/**
+ * 在**假窗口进程**里跑 hook —— 唯一能测到"真实那条祖先 walk"的夹具。
+ *
+ * 为什么要造一个进程：hook 自己的 pid 只有起来之后才知道，假 procRoot 里没法预先摆好
+ * 它自己那一层；而本用例要钉的恰恰是"从 hook 自己往上找"这条链。假窗口用
+ * `exec -a kimi-code` 把 argv[0] 换成 `kimi-code`，于是 `/proc/<pid>/cmdline` 就是
+ * `kimi-code`，与真窗口在 `cmdlineRole` 眼里完全一样；再由它按引擎的形态
+ * （`shell: true` ⇒ `/bin/sh -c`）拉起 hook。
+ *
+ * **不注入 `AGENT_BUS_TUI_PID`（显式删掉），也不注入 `AGENT_BUS_PROC_ROOT`** ⇒ hook 走
+ * 真实 /proc、真实那条 walk。home 仍然是临时的（`HOME` 与 `KIMI_CODE_HOME` 一起指过去），
+ * 不碰开发者真实的数据目录。
+ *
+ * @param cmd shell 里的 hook 命令；两种祖先链形态靠它区分：
+ *   `node "<hook>"` ⇒ `/bin/sh -c` 把命令 exec 掉（生产形态：hook 的直接父进程就是窗口）；
+ *   `node "<hook>"; :` ⇒ 复合命令，sh 不能 exec，祖先链上多出一层 shell。
+ * @returns {{status:number, stdout:string, stderr:string, windowPid:number|null, hookStatus:number|null}}
+ *   `status`/`stdout`/`stderr` 是假窗口那一层的；`hookStatus` 是 hook 自己的退出码。
+ */
+export function runHookInFakeWindow(payload, { home, cmd }) {
+  if (!home) throw new Error('runHookInFakeWindow 需要 home');
+  const pidFile = join(home, 'fake-window.pid');
+  const env = {
+    ...process.env,
+    HOME: home,
+    KIMI_CODE_HOME: home,
+    KIMI_PLUGIN_ROOT: REPO,
+    FAKE_WINDOW_PIDFILE: pidFile,
+    FAKE_WINDOW_CMD: cmd,
+    FAKE_WINDOW_PAYLOAD: JSON.stringify(payload),
+  };
+  delete env.AGENT_BUS_TUI_PID;
+  delete env.AGENT_BUS_PROC_ROOT;
+  const r = spawnSync('/bin/bash', ['-c', `exec -a kimi-code "${process.execPath}" < "${FAKE_WINDOW}"`],
+    { encoding: 'utf8', env });
+  let inner = {};
+  try { inner = JSON.parse(r.stdout ?? ''); } catch { /* 假窗口自己都没跑起来：交给断言去说 */ }
+  let windowPid = null;
+  try { windowPid = Number(readFileSync(pidFile, 'utf8')); } catch { /* 同上 */ }
+  return {
+    status: r.status,
+    stdout: inner.stdout ?? '',
+    stderr: `${r.stderr ?? ''}${inner.stderr ?? ''}`,
+    windowPid: Number.isInteger(windowPid) ? windowPid : null,
+    hookStatus: inner.status ?? null,
+  };
 }
 
 /**

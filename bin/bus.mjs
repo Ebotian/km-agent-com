@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readFileSync, watch } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { openDb, appendLog, DATE_MAX_MS } from '../lib/db.mjs';
@@ -9,6 +10,19 @@ import * as identity from '../lib/identity.mjs';
 import * as claims from '../lib/claims.mjs';
 import * as posts from '../lib/posts.mjs';
 import * as render from '../lib/render.mjs';
+
+/**
+ * 插件根**靠自定位**：从本文件的位置往上推一层（`bin/` → 插件根）。
+ *
+ * 不读 `KIMI_PLUGIN_ROOT`：那个变量是引擎注入**插件 hook 进程**的，agent 的 `Bash` 工具
+ * 继承的是 TUI 进程的环境，里面**没有**它。写进 agent 上下文的提示行（"取正文: …"、
+ * "重新武装: …"）一旦拿它拼路径就会退化成 `node ./bin/bus.mjs …`——相对 agent 的 cwd 解析，
+ * 一行**看起来能照抄、实际跑不通**的命令，而 agent 很可能直接照抄。
+ *
+ * 脚本自己的位置在任何环境里都成立，而且**永远是引擎实际在跑的那一份**（`/plugins install`
+ * 之后是托管副本，源码目录里跑就是源码目录）——这是环境变量给不了的保证。
+ */
+const PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 // 下游提前关闭（`| head -2`、分页读取）会让异步写抛 EPIPE。此时输出已无人接收，
 // 直接退出即可——没有还值得排空的缓冲。但退出码不能丢：命令可能已经置了非零码
@@ -136,16 +150,21 @@ function rowRow(r) {
   };
 }
 
-/** 自身身份：显式 --session 优先，否则沿 /proc 找 kimi-code 祖先再查 presence */
+/**
+ * 自身身份：显式 `--session` 优先，否则 `--tui-pid`，再否则从**自己**往上沿 /proc 找
+ * kimi-code 祖先（`resolveWindow`，与 hook 共用同一步），最后拿 pid 查 presence。
+ *
+ * 起点是 `process.pid` 而不是 `process.ppid`：CLI 也是被壳层拉起来的，中间有没有一层
+ * shell 取决于命令形态，从父进程起算会跳过窗口那一层（见 `findKimiAncestor`）。
+ */
 function resolveSelf(c, { required = true } = {}) {
   const explicit = c.flags.session;
-  const pidFromEnv = c.flags['tui-pid'] ? Number(c.flags['tui-pid']) : null;
   if (explicit) {
     const row = c.db.prepare('SELECT * FROM presence WHERE session_id = ?').get(explicit);
     if (!row) throw new Error(`本窗口未在 presence 中登记（session=${explicit}）`);
     return rowRow(row);
   }
-  const tuiPid = pidFromEnv ?? identity.findKimiAncestor(process.ppid, c.procRoot);
+  const tuiPid = identity.resolveWindow({ procRoot: c.procRoot, pid: c.flags['tui-pid'] });
   if (tuiPid == null) {
     if (required) throw new Error('找不到所属窗口；请用 --session <id> 显式指定');
     return null;
@@ -274,10 +293,9 @@ function cmdDigest(c) {
   const r = posts.poll(c.db, { reader: me.sessionId });
   const peer = identity.listPresence(c.db, { now: c.now, procRoot: c.procRoot })
     .find(p => p.sessionId === me.sessionId);
-  const pluginRoot = process.env.KIMI_PLUGIN_ROOT || '.';
   const block = render.digestBlock({
     strong: r.strong, weak: r.weak, strongHidden: r.strongHidden, weakHidden: r.weakHidden, total: r.total,
-    reader: me.sessionId, pluginRoot, deaf: peer?.deaf ?? null,
+    reader: me.sessionId, pluginRoot: PLUGIN_ROOT, deaf: peer?.deaf ?? null,
   });
   // 推到 `ackUpTo` 而不是 `nextCursor`：某一轴被单轮上限截掉的那几条还没投出去，推过它们
   // 就是"计数报了、内容永远不到"那个缺陷的另一种写法。
@@ -524,7 +542,7 @@ function emitWatchResult(c, me, r) {
   }
   const block = render.digestBlock({
     strong: r.strong, weak: r.weak, strongHidden: r.strongHidden, weakHidden: r.weakHidden, total: r.total,
-    reader: me.sessionId, pluginRoot: process.env.KIMI_PLUGIN_ROOT || '.',
+    reader: me.sessionId, pluginRoot: PLUGIN_ROOT,
   });
   process.stdout.write((block ? block + '\n' : '') + JSON.stringify(payload) + '\n');
 }
@@ -641,7 +659,7 @@ async function cmdWatch(c) {
     // `--json` 时同样保持"单行 JSON"的约定，但**不带 `strong`**——判据是"最后一行能否
     // parse 成带 strong 的对象"，两种形态下都成立。
     if (reason !== 'hit') {
-      const note = watchExitNote(reason, process.env.KIMI_PLUGIN_ROOT || '.');
+      const note = watchExitNote(reason, PLUGIN_ROOT);
       process.stdout.write(c.flags.json
         ? JSON.stringify({ watchedBy: process.pid, reason, message: note }) + '\n'
         : note + '\n');
