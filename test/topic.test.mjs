@@ -54,3 +54,16 @@ test('normalizeTopic 保留 slug 语义', () => {
 test('matches 用纯字符串比较：_ 不是单字符通配符', () => {
   assert.equal(matches('a', 'a_b'), false);
 });
+
+test('normalizeTopic 把 NFD 与 NFC 归一到同一主题', () => {
+  assert.equal(normalizeTopic('e\u0301'), normalizeTopic('\u00e9'));
+});
+
+test('normalizeTopic 放行组合附加符号', () => {
+  assert.equal(normalizeTopic('हिन्दी'), 'हिन्दी');
+});
+
+test('normalizeTopic 仍把 / 当分隔符、% 当可折叠符号', () => {
+  assert.equal(normalizeTopic('a/b'), 'a/b');
+  assert.equal(normalizeTopic('%20'), '20');
+});
