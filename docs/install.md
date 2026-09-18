@@ -65,6 +65,10 @@ KIMI_PLUGIN_ROOT=~/km-agent-com node ~/km-agent-com/bin/bus.mjs peers
 node ~/km-agent-com/bin/bus.mjs watch
 ```
 
+**在终端里手工跑**用上面这条就够了；**让 agent 去武装**时要交代一句：那个 `Bash` 后台任务必须带
+`disable_timeout: true`。引擎给后台任务的默认超时是 600 秒，漏掉它的话 watcher 十分钟后就被掐掉
+（审计日志里 `watch-stop 0 signal`），而 `--timeout 43200` 那 12 小时一秒都没走到。
+
 还想更彻底地自检，就在克隆里跑端到端脚本（全程在临时 home，不碰真实数据，也不动已装插件）：
 
 ```bash

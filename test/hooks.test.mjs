@@ -419,6 +419,11 @@ test('UserPromptSubmit 的重新武装行在 KIMI_PLUGIN_ROOT 缺席时仍是存
     const r = runHook(event('UserPromptSubmit'), { home, tuiPid: ME_PID, pluginRoot: null });
     assert.equal(r.status, 0, r.stderr);
     assert.match(r.stdout, /重新武装/, '没有 presence 行 ⇒ 从未武装 ⇒ 必须提示重新武装');
+    // 提示的下游是 agent 的"重新武装"动作，而它最常踩的坑不在命令本身、在启动姿势：引擎给
+    // 后台任务的默认超时是 600 秒，漏掉 `disable_timeout` 就十分钟死一次。同一段提示里必须
+    // 交代这件事，否则每次自愈都复现同一个故障。
+    assert.match(r.stdout, /disable_timeout/,
+      `重新武装的提示要带上"后台任务得设 disable_timeout"：\n${r.stdout}`);
     assert.equal(r.stdout.includes('./bin/bus.mjs'), false,
       `提示行不能是相对路径（agent 照抄时相对它的 cwd 解析）:\n${r.stdout}`);
 

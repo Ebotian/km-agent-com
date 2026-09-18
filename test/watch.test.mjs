@@ -328,6 +328,12 @@ test('M5：信号退出也有话说，且能一眼与"到期"区分', async () =
     assert.equal(await waitExit(w.child), 0, w.stderr);
     assert.match(w.stdout, /信号/);
     assert.match(w.stdout, /本轮无消息/);
+    // 信号退出在现场最常见的来源，是引擎按后台任务的**默认 600 秒**超时掐的（`--timeout 43200`
+    // 管不到那一层）。提示里不写"怎么起才不会再被掐"，重新武装必然用同一个姿势再死一次。
+    assert.match(w.stdout, /disable_timeout/, '信号退出要顺带交代引擎那层 600 秒超时怎么关');
+    const rearmLine = w.stdout.split('\n').find(l => l.includes('重新武装:'));
+    assert.ok(/重新武装: node (.+) watch --timeout 43200$/.test(rearmLine),
+      `加了交代也不能弄坏重新武装行（下游按它正则取路径）：${rearmLine}`);
   } finally { cleanup(home); }
 });
 
