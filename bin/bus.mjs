@@ -564,7 +564,13 @@ function watchExitNote(reason, pluginRoot) {
     signal: 'watcher 被信号停掉',
     'max-wait': 'watcher 因 --max-wait 到点退出',
   }[reason] ?? `watcher 退出（${reason}）`;
-  return `${why}，本轮无消息。重新武装: node ${pluginRoot}/bin/bus.mjs watch --timeout 43200`;
+  // 信号退出在现场最常见的原因不是用户撤下，而是**引擎**按后台任务的默认超时（600 秒）
+  // 把它掐掉：`--timeout 43200` 只管 watcher 自己的租约，管不到引擎那一层。所以这行提示
+  // 必须同时给出"怎么起才不会再被掐"，否则重新武装会用同一个姿势再死一次。
+  const how = reason === 'signal'
+    ? '（大概率是引擎掐的：Bash 后台任务默认 600 秒超时，重新武装记得设 disable_timeout: true）'
+    : '';
+  return `${why}${how}，本轮无消息。重新武装: node ${pluginRoot}/bin/bus.mjs watch --timeout 43200`;
 }
 
 /**

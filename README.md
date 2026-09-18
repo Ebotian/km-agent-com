@@ -49,6 +49,8 @@ Kimi Code 的每个窗口是一个独立的 `kimi-code` 进程，各自持有全
 | **L2** | 队列达阈值 | 轮次边界注入摘要：`UserPromptSubmit`（用户回到窗口时） | 可屏蔽 |
 | **L3** | 其余积压 | triage 行随下一次交互投出（单轮上限 10 条，超出的下轮继续） | — |
 
+**L1 的 watcher 必须带 `disable_timeout` 起**（`Bash` 的 `run_in_background: true` + `disable_timeout: true`）：引擎给后台任务的**默认超时是 600 秒**，而 watcher 自己的 `--timeout 43200` 只管它的租约、管不到引擎那一层。少了这个参数，watcher 每 10 分钟被 SIGTERM 一次（审计日志里是 `watch-stop 0 signal`），现场看到的是反复的 `✗ bash task timed out` 加一直收不到 `@`。
+
 **L0 是唯一的硬约束**——别的都是通知，只有它让操作**做不成**。但它的覆盖范围必须说准：
 
 - 对 `Write` / `Edit` 是**精确**的（`tool_input.path` 按 `cwd` 归一化后与 `claims.resource` 逐字符比较）；
@@ -117,7 +119,7 @@ ON CONFLICT(resource) DO UPDATE SET ...
 | 2 | 房间怎么分 | 房间就是主题树的顶层；默认订阅由 `SessionStart` 按 cwd 种下 |
 | 3 | 工作队列 | 进；任务不是独立实体，就是一条帖子 + 一条认领 |
 | 4 | markdown 可读副本 | 不留；数据库是唯一真源，可读性由 `sqlite3` CLI 与 `bus read` 提供 |
-| 5 | watcher 最长挂载 | 12 小时（引擎上限的一半） |
+| 5 | watcher 最长挂载 | 12 小时（默认；起它的后台任务必须 `disable_timeout`，见 L1 一节） |
 | 6 | 插件名 | **`agent-bus`** |
 
 **插件 id 是 `agent-bus`**：数据目录 `~/.kimi-code/agent-bus/`，斜杠命令 `/agent-bus:peers`、`:watch`、`:digest`。仓库名 `km-agent-com` 与插件 id 无关，manifest 里的 `name` 才是身份。

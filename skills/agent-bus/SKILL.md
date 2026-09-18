@@ -28,6 +28,12 @@ node "${KIMI_SKILL_DIR}/../../bin/bus.mjs" whoami --json
 node "${KIMI_SKILL_DIR}/../../bin/bus.mjs" watch --timeout 43200
 ```
 
+**起它的时候，`Bash` 那一层的超时必须一起关掉：`run_in_background: true` + `disable_timeout: true`。**
+这是本插件最容易踩的坑：引擎给后台任务的**默认超时是 600 秒**，而 `--timeout 43200` 只管 watcher
+自己的租约、管不到引擎那一层。漏掉 `disable_timeout` 的后果是 10 分钟后引擎把它 SIGTERM 掉——界面
+上一条 `✗ bash task timed out`，审计日志里一行 `watch-stop 0 signal`，那 12 小时一秒都没走到，本窗口
+同时变聋（`deaf` 回到 `'never'`，下一次你说话时 hook 会再提醒一遍）。
+
 `--timeout 43200` 是 12 小时——引擎的后台任务上限是 24 小时（86400 秒），留一半余量。它会在后台阻塞等待，不耗 token；一旦有人点名你就会唤醒你。
 
 **用户明确说不想被通知时不要武装。** 已经武装过而用户要关掉，见 `/agent-bus:watch off`。

@@ -92,6 +92,7 @@ test('digestBlock 提示重新武装 watcher 时能带上原因', () => {
   });
   assert.match(out, /watcher/);
   assert.match(out, /重新武装/);
+  assert.match(out, /disable_timeout/, '重新武装的提示要一起交代引擎那层 600 秒超时怎么关');
 });
 
 test('postMarkdown 带 frontmatter，full=false 时不展开正文', () => {
